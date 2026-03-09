@@ -1,10 +1,10 @@
 services:
   claude-slack-bridge:
+    container_name: claude-slack-bridge
     build: .
     env_file:
       - .env
     environment:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - SLACK_CHANNEL=${SLACK_CHANNEL}
     restart: unless-stopped

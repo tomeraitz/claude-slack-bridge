@@ -7,10 +7,9 @@ point retains full control over the server lifecycle.
 """
 
 import logging
+from typing import Any
 
 from fastmcp import FastMCP
-
-from message_broker import MessageBroker
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +19,14 @@ class MCPServer:
     Registers MCP tools that bridge Claude Code to Slack.
 
     This class is intentionally thin: it owns only the tool definitions and
-    delegates all Slack I/O to ``MessageBroker``.
+    delegates all Slack I/O to the broker.
 
     Args:
-        broker: The ``MessageBroker`` instance used to send messages and await
-                replies. Injected at construction time for testability.
+        broker: Any object with ``send_and_wait(message: str) -> str``.
+                Injected at construction time for testability.
     """
 
-    def __init__(self, broker: MessageBroker) -> None:
+    def __init__(self, broker: Any) -> None:
         self._broker = broker
 
     def register(self, mcp: FastMCP) -> None:

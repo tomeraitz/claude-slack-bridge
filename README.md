@@ -7,6 +7,9 @@ Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──�
 ```
 
 ---
+![slack-claude-small](https://github.com/user-attachments/assets/d4460f40-5c68-48a0-8fc5-9b386881a765)
+
+
 
 ## What It Does
 

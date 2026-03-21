@@ -93,6 +93,16 @@ Create `.mcp.json` in the root of any project where you want Claude to be able t
 
 > **Important:** Add `.mcp.json` to your `.gitignore` — it contains your channel name and is project-specific.
 
+### 4. Add the Slack communication rule to your `CLAUDE.md`
+
+To make Claude automatically use Slack for all communication once it sends its first message, add the following to your project's `CLAUDE.md`:
+
+```markdown
+Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a conversation, ALL further communication with the user must go through that tool. Do not use `AskUserQuestion`, and do not ask questions or request feedback as text in the terminal. Continue communicating exclusively via Slack until the user explicitly tells you to switch back to the terminal.
+```
+
+Without this, Claude will only use Slack when it decides to — with it, Claude locks in to Slack after the first message and stays there for the rest of the session.
+
 That's it. Open the project in Claude Code and Claude will have access to `ask_on_slack`.
 
 ---

@@ -114,7 +114,11 @@ class ClaudeHandler:
 
         if process.returncode != 0:
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-            logger.error("Claude CLI failed (rc=%d): %s", process.returncode, stderr_text)
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+            logger.error(
+                "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
+                process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
+            )
             return "Sorry, I encountered an error processing your request."
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()

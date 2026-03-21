@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 
-PostMessageFn = Callable[[str], Coroutine[Any, Any, str]]
+PostMessageFn = Callable[[str, str | None], Coroutine[Any, Any, str]]
 
 
 class SessionBroker:
@@ -24,12 +24,14 @@ class SessionBroker:
 
     Args:
         post_message:    Async callable that posts to Slack and returns thread_ts.
+                         Signature: (text, thread_ts | None) -> thread_ts.
         timeout_minutes: Seconds to wait for a reply before raising RuntimeError.
     """
 
     def __init__(self, post_message: PostMessageFn, timeout_minutes: int = 5) -> None:
         self._post_message = post_message
         self._timeout = timeout_minutes * 60.0
+        self._thread_ts: str | None = None
 
     async def send_and_wait(self, message: str) -> str:
         """
@@ -44,7 +46,9 @@ class SessionBroker:
         Raises:
             RuntimeError: If no reply arrives within the configured timeout.
         """
-        thread_ts = await self._post_message(message)
+        thread_ts = await self._post_message(message, self._thread_ts)
+        if self._thread_ts is None:
+            self._thread_ts = thread_ts
         logger.info("Posted message, awaiting reply on thread %s.", thread_ts)
 
         reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)

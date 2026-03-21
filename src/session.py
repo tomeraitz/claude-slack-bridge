@@ -37,17 +37,20 @@ async def run(config: Config) -> None:
     """
     app = AsyncApp(token=config.slack_bot_token)
 
-    async def post_message(text: str) -> str:
-        response = await app.client.chat_postMessage(
+    async def post_message(text: str, thread_ts: str | None = None) -> str:
+        kwargs: dict = dict(
             channel=config.slack_channel,
             text=f"<!channel> {text}",
             mrkdwn=True,
         )
+        if thread_ts is not None:
+            kwargs["thread_ts"] = thread_ts
+        response = await app.client.chat_postMessage(**kwargs)
         if not response.get("ok"):
             raise RuntimeError(f"Slack API error: {response.get('error')}")
-        thread_ts: str = response["ts"]
-        logger.info("Posted to %s, thread_ts=%s", config.slack_channel, thread_ts)
-        return thread_ts
+        ts: str = response["ts"]
+        logger.info("Posted to %s, thread_ts=%s", config.slack_channel, thread_ts or ts)
+        return thread_ts or ts
 
     broker = SessionBroker(
         post_message=post_message,

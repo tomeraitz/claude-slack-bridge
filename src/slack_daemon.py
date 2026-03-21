@@ -47,6 +47,7 @@ class SlackDaemon:
         self._lock = asyncio.Lock()
         self._claude = ClaudeHandler(slack_client=self._app.client)
         self._active_threads: set[str] = set()
+        self._bot_user_id: str = ""
 
         self._app.event("message")(self._handle_slack_message)
 
@@ -83,7 +84,14 @@ class SlackDaemon:
             asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
             return
 
-        # Case 3: Top-level message — start new Claude conversation.
+        # Case 3: Top-level message — only respond if the bot is mentioned.
+        mention_tag = f"<@{self._bot_user_id}>"
+        if mention_tag not in text:
+            return
+
+        # Strip the mention from the text so Claude sees clean input.
+        text = text.replace(mention_tag, "").strip()
+
         message_ts: str = event.get("ts", "")
         if message_ts in self._active_threads:
             return
@@ -159,6 +167,7 @@ class SlackDaemon:
     async def start(self) -> None:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
+        self._bot_user_id = self._claude._bot_user_id
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)

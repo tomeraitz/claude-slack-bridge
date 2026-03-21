@@ -1,9 +1,13 @@
 # Claude ↔ Slack Bridge
 
-An MCP server that lets Claude Code pause and ask a human a question via Slack — then resume once you reply.
+A two-way bridge between Claude Code and Slack:
+
+- **Claude → Slack:** Claude pauses mid-task, asks a question via Slack, waits for your reply, and resumes.
+- **Slack → Claude:** Tag the bot in a Slack channel and Claude runs with full project context — it knows which project to work on based on the channel.
 
 ```
 Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──▶  Claude Code resumes
+Slack @bot   ──────────────────▶  claude -p (in project dir) ──▶  reply in thread
 ```
 
 ---
@@ -115,6 +119,7 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 |---|---|---|
 | `SLACK_BOT_TOKEN` | Yes | Bot OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | Socket Mode app token (`xapp-...`) |
+| `PROJECTS_DIR` | Yes | Absolute path to the parent directory containing all your projects |
 
 ### `.mcp.json` (per project — set per Claude Code project)
 
@@ -143,6 +148,57 @@ You can also prompt Claude explicitly:
 
 ---
 
+## Slack → Claude (Project-Aware Bot)
+
+You can also tag the bot directly in Slack to interact with a project. The bot detects which project to use based on the channel.
+
+### How it works
+
+1. You tag `@claude-bot` in a Slack channel (e.g. `#my-project`).
+2. The daemon looks up the channel in `projects.json` to find the matching project directory.
+3. It runs `claude -p` from that project directory inside the container — so Claude sees the project's `CLAUDE.md`, codebase, and full context.
+4. The response is posted back as a thread reply.
+5. You can continue the conversation by replying in the thread.
+
+### Setup
+
+#### 1. Set `PROJECTS_DIR` in `.env`
+
+Point it to the parent directory that contains all your projects:
+
+```
+PROJECTS_DIR=C:\Users\you\projects
+```
+
+This directory is mounted into the container at `/projects/`.
+
+#### 2. Create `projects.json`
+
+Map each Slack channel to its project folder name (relative to `/projects/` inside the container):
+
+```json
+{
+  "#my-project-channel": "/projects/my-project",
+  "#another-channel": "/projects/another-project"
+}
+```
+
+> **Tip:** The folder names must match the directory names inside `PROJECTS_DIR`. For example, if `PROJECTS_DIR=C:\Users\you\projects` and you have `C:\Users\you\projects\my-project`, then the container path is `/projects/my-project`.
+
+See `projects.json.example` for a template.
+
+#### 3. Rebuild
+
+```bash
+docker compose up -d --build
+```
+
+#### Adding new projects
+
+Just add a line to `projects.json` and rebuild. No changes to `docker-compose.yml` needed.
+
+---
+
 ## Project Structure
 
 ```
@@ -157,6 +213,8 @@ claude-slack-two-way/
 ├── docs/
 │   ├── slack-setup.md        # Step-by-step Slack app creation guide
 │   └── mcp-client-setup.md   # How to wire .mcp.json in a Claude Code project
+├── projects.json          # Channel → project path mapping (gitignored)
+├── projects.json.example  # Template for projects.json
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

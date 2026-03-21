@@ -21,8 +21,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
+# Copy application source and project config
 COPY src/ ./src/
+COPY projects.json .
 
 RUN chown -R appuser:appuser /app
 

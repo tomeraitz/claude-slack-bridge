@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
+RUN useradd -m appuser
+
 WORKDIR /app
 
 # Install dependencies first for layer caching
@@ -21,6 +23,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY src/ ./src/
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
 
 WORKDIR /app/src
 

@@ -10,4 +10,6 @@ services:
     volumes:
       # Mount Claude CLI credentials (read-only); CLI writes session data inside the container
       - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
+      # Mount all projects so claude -p can run from the correct project directory
+      - ${PROJECTS_DIR}:/projects
     restart: unless-stopped

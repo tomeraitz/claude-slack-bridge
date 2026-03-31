@@ -15,6 +15,10 @@ receive the reply when it arrives — no polling, OS-level blocking I/O.
 import asyncio
 import logging
 
+from dotenv import load_dotenv
+
+load_dotenv()  # populate os.environ from .env before any config/security reads
+
 from config import Config
 from slack_daemon import SlackDaemon
 

@@ -8,11 +8,15 @@ full context (tool use, reasoning) across messages in the same thread.
 If the session ID is lost (e.g. container restart), falls back to a one-shot
 ``claude -p`` with the formatted thread history as the prompt.
 
-Project detection: reads ``/app/projects.json`` to map Slack channels to
-project directories mounted at ``/projects/`` inside the container.  When a
-message arrives, the handler resolves the channel to a project path and runs
-``claude -p`` from that directory so Claude sees the project's CLAUDE.md and
-codebase.
+Project detection: reads ``projects.json`` at the repo root to map Slack
+channels to project directories.  When a message arrives, the handler resolves
+the channel to a project path and runs ``claude -p`` from that directory so
+Claude sees the project's CLAUDE.md and codebase.
+
+Each entry in ``projects.json`` can be a plain path string (legacy) or a dict
+with ``path`` and an optional ``plugin_dir`` field.  When ``plugin_dir`` is
+set, ``--plugin-dir <dir>`` is prepended to the ``claude -p`` invocation so
+that project-specific skills are loaded automatically.
 """
 
 import asyncio
@@ -29,8 +33,12 @@ SUBPROCESS_TIMEOUT = 300  # 5 minutes
 PROJECTS_CONFIG = Path(__file__).parent.parent / "projects.json"
 
 
-def _load_project_map() -> dict[str, str]:
-    """Load channel-name → container project-path mapping from projects.json."""
+def _load_project_map() -> dict[str, Any]:
+    """Load channel → project config mapping from projects.json.
+
+    Values may be a plain path string (legacy) or a dict with ``path`` and
+    optional ``plugin_dir`` keys (extended format).
+    """
     if not PROJECTS_CONFIG.exists():
         logger.warning("No projects.json at %s — project detection disabled.", PROJECTS_CONFIG)
         return {}
@@ -52,9 +60,9 @@ class ClaudeHandler:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
-        self._project_map: dict[str, str] = _load_project_map()
-        # Resolved at startup: channel ID → container project path.
-        self._channel_id_to_project: dict[str, str] = {}
+        self._project_map: dict[str, Any] = _load_project_map()
+        # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None}
+        self._channel_id_to_project: dict[str, dict] = {}
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID and resolve channel names to IDs."""
@@ -75,38 +83,47 @@ class ClaudeHandler:
         self._sessions[message_ts] = session_id
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
-        project_dir = self._get_project_dir(channel)
-        cmd = self._build_cmd(session_id=session_id)
+        project_dir, plugin_dir = self._get_project_config(channel)
+        cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
         return await self._run_claude(cmd, text, cwd=project_dir)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
-        project_dir = self._get_project_dir(channel)
+        project_dir, plugin_dir = self._get_project_config(channel)
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
-            cmd = self._build_cmd(resume=session_id)
+            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
             return await self._run_claude(cmd, text, cwd=project_dir)
 
         # Fallback: session lost (container restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd()
+        cmd = self._build_cmd(plugin_dir=plugin_dir)
         return await self._run_claude(cmd, prompt, cwd=project_dir)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _get_project_dir(self, channel_id: str) -> str | None:
-        """Look up the mounted project directory for a Slack channel ID."""
-        project_dir = self._channel_id_to_project.get(channel_id)
-        if project_dir:
-            logger.info("Channel %s → project %s", channel_id, project_dir)
-        else:
-            logger.info("No project mapping for channel %s — using default cwd.", channel_id)
-        return project_dir
+    def _get_project_config(self, channel_id: str) -> tuple[str | None, str | None]:
+        """Return (project_dir, plugin_dir) for a Slack channel ID.
+
+        Both values are ``None`` when no mapping exists for the channel.
+        """
+        config = self._channel_id_to_project.get(channel_id)
+        if config:
+            path = config["path"]
+            plugin_dir = config["plugin_dir"]
+            logger.info(
+                "Channel %s → project %s%s",
+                channel_id, path,
+                f" (plugin_dir={plugin_dir})" if plugin_dir else "",
+            )
+            return path, plugin_dir
+        logger.info("No project mapping for channel %s — using default cwd.", channel_id)
+        return None, None
 
     async def _resolve_channel_ids(self) -> None:
         """Resolve channel names from project_map to Slack channel IDs."""
@@ -122,11 +139,32 @@ class ClaudeHandler:
                 name_to_id[ch["name"]] = ch["id"]
                 name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
 
-            for channel_key, project_path in self._project_map.items():
+            for channel_key, value in self._project_map.items():
+                # Normalise both the legacy string format and the new dict format.
+                if isinstance(value, str):
+                    config = {"path": value, "plugin_dir": None}
+                else:
+                    config = {"path": value.get("path"), "plugin_dir": value.get("plugin_dir")}
+
+                # DM channel IDs (D...) and raw channel IDs (C...) are not
+                # returned by conversations_list — register them directly.
+                if channel_key.startswith(("C", "D")) and channel_key not in name_to_id:
+                    self._channel_id_to_project[channel_key] = config
+                    logger.info(
+                        "Mapped %s (raw ID) → %s%s",
+                        channel_key, config["path"],
+                        f" plugin_dir={config['plugin_dir']}" if config["plugin_dir"] else "",
+                    )
+                    continue
+
                 channel_id = name_to_id.get(channel_key)
                 if channel_id:
-                    self._channel_id_to_project[channel_id] = project_path
-                    logger.info("Mapped %s (ID: %s) → %s", channel_key, channel_id, project_path)
+                    self._channel_id_to_project[channel_id] = config
+                    logger.info(
+                        "Mapped %s (ID: %s) → %s%s",
+                        channel_key, channel_id, config["path"],
+                        f" plugin_dir={config['plugin_dir']}" if config["plugin_dir"] else "",
+                    )
                 else:
                     logger.warning("Channel %s not found in workspace — skipping.", channel_key)
 
@@ -137,8 +175,11 @@ class ClaudeHandler:
     def _build_cmd(
         session_id: str | None = None,
         resume: str | None = None,
+        plugin_dir: str | None = None,
     ) -> list[str]:
         cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        if plugin_dir:
+            cmd.extend(["--plugin-dir", plugin_dir])
         if session_id:
             cmd.extend(["--session-id", session_id])
         if resume:

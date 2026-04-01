@@ -195,7 +195,88 @@ docker compose up -d --build
 
 #### Adding new projects
 
-Just add a line to `projects.json` and rebuild. No changes to `docker-compose.yml` needed.
+Just add a line to `projects.json` and restart the daemon. No changes to `docker-compose.yml` needed.
+
+---
+
+## `projects.json` — Channel → Project Routing
+
+`projects.json` maps Slack channel keys to project configurations. It is gitignored and lives at the repo root.
+
+### Channel key formats
+
+| Format | Example | When to use |
+|---|---|---|
+| `#channel-name` | `#my-project` | Named public/private channels |
+| Channel ID | `C012AB3CD45` | When you know the raw Slack channel ID |
+| DM channel ID | `D095AGC9LLF` | Direct messages to the bot |
+
+### Entry formats
+
+**Plain string (legacy — still fully supported):**
+
+```json
+{
+  "#my-project": "/path/to/project"
+}
+```
+
+**Dict with optional `plugin_dir`:**
+
+```json
+{
+  "#my-project": {
+    "path": "/path/to/project",
+    "plugin_dir": "/path/to/skill"
+  }
+}
+```
+
+Both formats can coexist in the same file. See `projects.json.example` for a full template.
+
+### `plugin_dir` — Loading Claude Code Skills
+
+When `plugin_dir` is set, the daemon passes `--plugin-dir <dir>` to `claude -p` so that a project-specific skill is loaded for every message in that channel.
+
+**Use case:** You have a Claude Code skill — a directory with custom slash commands and a `CLAUDE.md` — that you want Claude to use automatically when someone messages the bot in a particular channel or DM.
+
+**Worked example — PE Support Skill:**
+
+The `pe-support-skill` handles Platform Engineering support tickets. It lives at `/Users/yen.chuang/repo/pe-support-skill` and its working directory is `/Users/yen.chuang/repo/pe-support-skill/pe-support-workspace`. When someone DMs the bot, the daemon runs:
+
+```
+claude -p --plugin-dir /Users/yen.chuang/repo/pe-support-skill \
+          --dangerously-skip-permissions \
+          --output-format json
+```
+
+from the workspace directory, so the skill's commands and `CLAUDE.md` are active for every response.
+
+`projects.json` entry:
+
+```json
+{
+  "D095AGC9LLF": {
+    "path": "/Users/yen.chuang/repo/pe-support-skill/pe-support-workspace",
+    "plugin_dir": "/Users/yen.chuang/repo/pe-support-skill"
+  }
+}
+```
+
+---
+
+## Two-File Configuration Design
+
+The daemon uses two separate config files, kept intentionally separate:
+
+| File | What it stores | Updated |
+|---|---|---|
+| `.env` | Secrets and runtime behavior — Slack tokens, security settings, timeouts | Set once at deployment |
+| `projects.json` | Channel → project routing table | Updated as projects are added or removed |
+
+**Why separate?** `.env` contains credentials that must never be committed. `projects.json` is a routing table — it changes frequently as teams onboard new projects, and it contains no secrets. Keeping them separate means you can share or version-control `projects.json` safely (if it contains no sensitive paths) without touching your secrets file.
+
+Both files are gitignored by default.
 
 ---
 

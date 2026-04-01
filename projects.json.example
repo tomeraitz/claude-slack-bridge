@@ -1,4 +1,14 @@
 {
-  "#your-channel-name": "/projects/your-project-folder",
-  "#another-channel": "/projects/another-project"
+  "#your-channel-name": "/path/to/project",
+
+  "#another-channel": "/path/to/another-project",
+
+  "D095AGC9LLF": {
+    "path": "/path/to/skill-workspace",
+    "plugin_dir": "/path/to/skill-root"
+  },
+
+  "C012AB3CD45": {
+    "path": "/path/to/project"
+  }
 }

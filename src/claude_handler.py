@@ -26,7 +26,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
-PROJECTS_CONFIG = Path("/app/projects.json")
+PROJECTS_CONFIG = Path(__file__).parent.parent / "projects.json"
 
 
 def _load_project_map() -> dict[str, str]:
@@ -191,15 +191,25 @@ class ClaudeHandler:
 
     @staticmethod
     def _parse_response(raw: str) -> str:
-        """Extract the response text from JSON output, or return raw text."""
+        """Extract the response text from JSON output, or return raw text.
+
+        Newer Claude CLI versions (>=2.1.x) emit a JSON array of streaming
+        events. Older versions emitted a single JSON dict. Handle both.
+        """
         try:
             data = json.loads(raw)
-            # The JSON output has a "result" field with the response text.
+            # New format: array of streaming events — find the result event.
+            if isinstance(data, list):
+                for event in reversed(data):
+                    if isinstance(event, dict) and event.get("type") == "result" and "result" in event:
+                        return event["result"]
+            # Old format: single dict with a "result" key.
             if isinstance(data, dict) and "result" in data:
                 return data["result"]
-            return raw
         except (json.JSONDecodeError, KeyError):
-            return raw
+            pass
+        logger.warning("Could not parse Claude output as JSON; returning raw.")
+        return raw
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""

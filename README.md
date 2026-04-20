@@ -130,6 +130,44 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 
 Set `SLACK_CHANNEL` per project so each project posts to its own dedicated channel.
 
+### Access control (optional)
+
+The daemon can restrict **who** can message the bot and **where**. Access control is off by default — leave `SECURITY_ENABLED` unset and you can skip this section entirely.
+
+Set the following in `.env` to enable:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SECURITY_ENABLED` | No | `false` | Master switch. When `false`, all other `SECURITY_*` vars are ignored. |
+| `SECURITY_STRICT_MODE` | No | `false` | `false` = empty allowlist means "allow all" for that dimension. `true` = empty allowlist means "deny all". |
+| `SECURITY_ALLOWED_USERS` | No | *(empty)* | Comma-separated Slack user IDs permitted to use the bot (e.g. `U0123ABC,U0456DEF`). |
+| `SECURITY_ALLOWED_CHANNELS` | No | *(empty)* | Comma-separated Slack channel IDs the bot will respond in. |
+| `SECURITY_ADMIN_USERS` | No | *(empty)* | User IDs that bypass the channel allowlist (still subject to the user allowlist). |
+| `SECURITY_REJECTION_MESSAGE` | No | `You are not authorized to use this bot.` | Reply sent to unauthorized users. |
+| `SECURITY_LOG_UNAUTHORIZED` | No | `true` | Emit a warning log line on each denial. |
+
+**Flexible vs strict mode**
+
+- **Flexible** (`SECURITY_STRICT_MODE=false`, default): an empty list means "no restriction on that dimension". Useful when you only want to restrict users OR channels, not both.
+- **Strict** (`SECURITY_STRICT_MODE=true`): an empty list means "deny everyone". Every permitted user and channel must be listed explicitly.
+
+**Finding Slack IDs**
+
+- **User ID** — click a profile → **Copy member ID** (starts with `U`).
+- **Channel ID** — open channel details → scroll to the bottom (starts with `C`).
+
+**Example — lock the bot to a specific team**
+
+```env
+SECURITY_ENABLED=true
+SECURITY_STRICT_MODE=true
+SECURITY_ALLOWED_USERS=U0123ABC,U0456DEF
+SECURITY_ALLOWED_CHANNELS=C07ENG,C07DEVOPS
+SECURITY_ADMIN_USERS=U0123ABC
+```
+
+With this config, only the two listed users can use the bot, only in the two listed channels, and the admin user can invoke the bot from any channel.
+
 ---
 
 ## The `ask_on_slack` Tool

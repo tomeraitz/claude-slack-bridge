@@ -22,6 +22,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
+from security import AccessControl, SecurityConfig
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +50,33 @@ class SlackDaemon:
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
 
+        self._access_control = AccessControl(SecurityConfig.from_env())
         self._app.event("message")(self._handle_slack_message)
+        self._app.event("app_mention")(self._handle_app_mention)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
         if event.get("bot_id"):
             return
 
+        user_id: str = event.get("user", "")
+        channel: str = event.get("channel", "")
+
+        # Access control: reject unauthorized users/channels before any processing.
+        if not self._access_control.is_allowed(user_id=user_id, channel_id=channel):
+            thread_ts = event.get("thread_ts") or event.get("ts", "")
+            try:
+                await self._app.client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=self._access_control.rejection_message(),
+                )
+            except Exception as exc:
+                logger.warning("Failed to send rejection message to %s: %s", channel, exc)
+            return
+
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
-        channel: str = event.get("channel", "")
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -96,6 +114,26 @@ class SlackDaemon:
         if message_ts in self._active_threads:
             return
         asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text))
+
+    async def _handle_app_mention(self, event: dict[str, Any]) -> None:
+        """Handle app_mention events (bot @mentioned in any channel)."""
+        user_id: str = event.get("user", "")
+        channel: str = event.get("channel", "")
+
+        if not self._access_control.is_allowed(user_id=user_id, channel_id=channel):
+            thread_ts = event.get("thread_ts") or event.get("ts", "")
+            try:
+                await self._app.client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=self._access_control.rejection_message(),
+                )
+            except Exception as exc:
+                logger.warning("Failed to send rejection message to %s: %s", channel, exc)
+            return
+
+        # Delegate to the normal message handler for authorized mentions.
+        await self._handle_slack_message(event)
 
     async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
         """Spawn Claude for a new top-level message and post the response as a thread reply."""

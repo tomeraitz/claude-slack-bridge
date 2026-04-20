@@ -148,7 +148,10 @@ class ClaudeHandler:
     async def _run_claude(self, cmd: list[str], prompt: str, cwd: str | None = None) -> str:
         """Spawn a ``claude -p`` subprocess and return the response text."""
         env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
+        # Strip tokens that must never be reachable by the Claude subprocess.
+        # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
+        for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
+            env.pop(_key, None)
 
         try:
             process = await asyncio.create_subprocess_exec(

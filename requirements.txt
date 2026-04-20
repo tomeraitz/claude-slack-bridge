@@ -2,3 +2,4 @@ fastmcp
 slack-bolt[async]
 aiohttp
 pydantic-settings
+pytest>=7

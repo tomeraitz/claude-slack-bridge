@@ -71,11 +71,15 @@ Record:
 
 ---
 
-## Step 3 — task manager: how is it integrated, and where do tasks live
+## Step 3 — task manager: how is it integrated, where do tasks live, and does it actually work
 
-Now ask the user three follow-up questions (in this order, one `AskUserQuestion` call per question is fine, or batch into one call with multiple questions). All four integration methods are valid for every manager — including GitHub. Do **not** assume `gh` for github; the user may prefer the GitHub MCP server, a custom plugin, or direct REST.
+Walk the user through these substeps in order. Do not skip ahead to writing the helper skill until Step 3e has verified the integration end-to-end.
+
+All four integration methods are valid for every manager — including GitHub. Do **not** assume `gh` for github; the user may prefer the GitHub MCP server, a custom plugin, or direct REST.
 
 ### 3a. Integration method
+
+Ask via `AskUserQuestion`:
 
 > How is `{task_manager_label}` integrated in this environment?
 
@@ -87,7 +91,36 @@ Options (single-select, in this order):
 
 Record the choice as `integration_method` ∈ `{mcp, cli, plugin, api}`.
 
-### 3b. Concrete invocation
+### 3b. Check whether the chosen integration is actually installed — offer to help install if not
+
+Before asking for the concrete invocation, do a quick availability check based on `integration_method`. The point is to catch the "user picked Linear MCP but never installed the Linear MCP server" case early, so we can offer to help.
+
+Run the matching check:
+- **mcp** — read `.mcp.json` again and look for a server entry whose key plausibly matches `{task_manager_slug}` (e.g. `linear`, `jira`, `github`, `notion`). If none match, treat as not installed.
+- **cli** — ask the user which CLI binary they intend to use (one short `AskUserQuestion`, free-text — e.g. `gh`, `linear`, `jira`). Then run `command -v <cli>` via Bash (or `where <cli>` on Windows). Non-zero exit ⇒ not installed.
+- **plugin** — ask the user which plugin / slash command they intend to use, then check whether it appears in the available skills/commands list for this session. Absent ⇒ not installed.
+- **api** — skip the install check; API integration only needs env vars, which Step 3c surfaces.
+
+If the check says **installed**, continue to Step 3c.
+
+If the check says **not installed**, ask via `AskUserQuestion`:
+
+> `{task_manager_label}` ({integration_method}) doesn't appear to be installed in this repo. Want me to help you set it up?
+
+Options:
+1. **Yes, help me install it** — proceed with the install flow below.
+2. **I'll install it myself, wait for me** — pause; ask the user to reply when they're done, then re-run the availability check.
+3. **Skip task manager integration** — set `integration_method = "none"`, skip Step 3c–3f entirely, and continue at Step 4. The helper skill will not be written.
+
+If the user picks **Yes, help me install it**, run the flow that matches `integration_method`:
+
+- **mcp** — propose the canonical MCP server for `{task_manager_slug}` (Linear → `@modelcontextprotocol/linear` style entry, GitHub → `@modelcontextprotocol/github`, etc.; if you're not certain of the exact package, ask the user to confirm the package name rather than guessing). Show the user the proposed `.mcp.json` server entry, ask which env vars they need (API key, workspace id), and only after they confirm append the entry to `.mcp.json` (preserving existing servers — never rewrite the whole file). Do **not** write secrets into `.mcp.json`; reference them via env vars and tell the user where to set them. After writing, ask the user to reload the MCP server (usually by restarting Claude Code) and confirm before continuing.
+- **cli** — detect the platform (`win32` on this user's machine, but check anyway). Propose the install command (`winget install …`, `scoop install …`, `brew install …`, `npm i -g …`, etc.) and ask the user to confirm before running. Run via Bash. After install, re-run `command -v <cli>` / `where <cli>` to verify.
+- **plugin** — ask the user for the plugin or marketplace name. If it's a Claude Code plugin, point them at `/plugin` to install it; do not try to install plugins from inside this skill. Wait for the user to confirm the plugin is loaded, then re-check availability.
+
+After install (or after the user says they've installed it themselves), re-run the availability check from the top of 3b. If it still fails, ask the user whether to retry, switch integration method (jump back to 3a), or skip (jump to Step 4 with `integration_method = "none"`). Do not loop more than 3 retries without offering to skip.
+
+### 3c. Concrete invocation
 
 Based on the chosen method, ask one targeted follow-up via `AskUserQuestion` (use the free-text "Other" channel — these answers are repo-specific):
 
@@ -98,13 +131,38 @@ Based on the chosen method, ask one targeted follow-up via `AskUserQuestion` (us
 
 Record as `integration_invocation` (free-text from the user).
 
-### 3c. Scope (project / team / workspace)
+### 3d. Scope (project / team / workspace)
 
 > Which project, team, or workspace holds the tasks for this repo, and how does `list-tasks` scope its query to it? (e.g. Linear team `ENG`, Jira project `PROJ`, GitHub repo `acme/web`, Notion DB id `abc123…`. Include the filter/parameter name if relevant — e.g. `team=ENG`, `repo=acme/web`.)
 
 Record as `scope` (single free-text field — keep it open-ended; the user types whatever identifier their tool needs).
 
-### 3d. Confirm and write the helper skill
+### 3e. Run the find-the-tasks flow together — verify before writing the skill
+
+Do not write the helper skill yet. First, actually fetch tasks once using the values gathered in 3a–3d. The goal is to (1) prove the integration works and (2) discover any missing scope/filter/auth before it's baked into the skill.
+
+Run the call that matches `integration_method`:
+
+- **mcp** — invoke the MCP tool named in `integration_invocation`, passing arguments derived from `scope`. If you're unsure which argument shape the tool expects, call it with the obvious mapping and let the error message guide a retry.
+- **cli** — run the exact command in `integration_invocation` via Bash. If `scope` includes a filter the command doesn't yet have (e.g. `team=ENG`), ask the user how to add it, then re-run.
+- **plugin** — invoke the slash command or skill via the Skill tool, passing `scope` as an argument if applicable.
+- **api** — issue the HTTP request via `curl` (or Python) using the env vars in `integration_invocation`. If a required env var is missing, surface it to the user before retrying.
+
+Show the user a short preview of what came back (e.g. the first 3 task titles, or the raw response trimmed). Then ask via `AskUserQuestion`:
+
+> I fetched `{N}` task(s) from `{task_manager_label}`. Does this look like the right list?
+
+Options:
+1. **Yes, that's my task list** — proceed to 3f.
+2. **No, the scope/filter is wrong** — ask which field is wrong and loop back to 3c or 3d as appropriate, then re-run 3e.
+3. **No, the call failed** — discuss the error with the user, fix the integration (may loop back to 3b for missing install, 3c for wrong invocation, or 3d for wrong scope), then re-run 3e.
+4. **The list is empty but the call succeeded — write it anyway** — accept and proceed to 3f. (Useful when the user has no open tasks right now but the integration is wired correctly.)
+
+Do not move to 3f until the user picks option 1 or 4. Cap the loop at ~5 retries; if it still doesn't work, offer to skip task manager integration (set `integration_method = "none"` and jump to Step 4).
+
+### 3f. Confirm and write the helper skill
+
+Now that the flow is verified, generate `.claude/skills/list-tasks/SKILL.md` from the plugin template.
 
 Read the plugin template at `<plugin-root>/templates/task-manager.md.tmpl` (use `${CLAUDE_PLUGIN_ROOT}` if set, otherwise resolve by searching upward from this skill's directory until you find `plugin.json`).
 

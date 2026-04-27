@@ -8,6 +8,7 @@ OS-level blocking I/O of asyncio Unix sockets — no polling.
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -32,6 +33,8 @@ class SessionBroker:
         self._post_message = post_message
         self._timeout = timeout_minutes * 60.0
         self._thread_ts: str | None = None
+        self._thread_ts = os.getenv("SLACK_THREAD_TS") or None
+        self._step_name: str | None = os.getenv("STEP_NAME") or None
 
     async def send_and_wait(self, message: str) -> str:
         """
@@ -46,6 +49,8 @@ class SessionBroker:
         Raises:
             RuntimeError: If no reply arrives within the configured timeout.
         """
+        if self._step_name and not message.startswith(f"[Step: {self._step_name}]"):
+            message = f"[Step: {self._step_name}] " + message
         thread_ts = await self._post_message(message, self._thread_ts)
         if self._thread_ts is None:
             self._thread_ts = thread_ts

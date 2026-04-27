@@ -1,0 +1,16 @@
+{
+  "name": "full-process",
+  "version": "1.0.0",
+  "description": "Drives a full feature-development workflow (clarify -> design -> plan -> execute -> PR -> test) over Slack via the claude-slack-bridge daemon. Ships /process-setup for one-time per-repo configuration and /process for clarification + handoff to the daemon's workflow engine.",
+  "author": {
+    "name": "claude-slack-bridge",
+    "url": "https://github.com/tomeraitz/claude-slack-bridge"
+  },
+  "homepage": "https://github.com/tomeraitz/claude-slack-bridge",
+  "license": "MIT",
+  "keywords": ["slack", "workflow", "process", "claude-code", "mcp"],
+  "skills": [
+    "./skills/process-setup",
+    "./skills/process"
+  ]
+}

@@ -111,6 +111,28 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 
 ---
 
+## Optional: `full-process` Plugin
+
+This repo also publishes a Claude Code plugin, **`full-process`**, that drives an end-to-end feature workflow (clarify → design → plan → execute → PR → test) over Slack using the bridge. It requires the bridge daemon to be running.
+
+### Install
+
+In any Claude Code project where the bridge is already wired up:
+
+```
+/plugin marketplace add tomeraitz/claude-slack-bridge
+/plugin install full-process@claude-slack-bridge
+```
+
+### Use
+
+1. In the consumer repo, post `/process-setup` in the Slack channel mapped to that repo. The plugin walks you through detecting your task manager, verifying GitHub auth, and writing `.claude/process-template.json`.
+2. Once setup is complete, post `/process` in the same channel to start a feature.
+
+The plugin will not function without `mcp__claude-slack-bridge__ask_on_slack` available — install the bridge first.
+
+---
+
 ## Configuration
 
 ### `.env` (daemon — set once, shared across all projects)

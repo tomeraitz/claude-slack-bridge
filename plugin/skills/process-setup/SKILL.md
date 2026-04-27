@@ -1,19 +1,13 @@
 ---
 name: process-setup
-description: "One-time per-repo configuration for the /process workflow. Detects a task manager, verifies GitHub credentials inside the bridge container, asks the user for the workflow steps and slash commands, writes .claude/process-template.json (version 1), generates an optional .claude/skills/list-tasks/SKILL.md helper, and appends .claude/worktrees/ and .claude/processes/ to .gitignore. Use when the user posts /process-setup in Slack or asks to set up / re-configure the /process workflow for this repository. Refuses to run while a feature is already in progress (.claude/processes/active exists)."
+description: "One-time per-repo configuration for the /process workflow. Verifies that mcp__claude-slack-bridge is installed in the repo, asks the user how their task manager is integrated (MCP server / CLI / plugin / direct API), generates a .claude/skills/list-tasks/SKILL.md helper from the user's answers, writes .claude/process-template.json (version 1), and appends .claude/worktrees/ and .claude/processes/ to .gitignore. Use when the user runs /process-setup or asks to set up / re-configure the /process workflow for this repository. Refuses to run while a feature is already in progress (.claude/processes/active exists)."
 ---
 
 # /process-setup — one-time per-repo configuration
 
 You are running the `/process-setup` skill for the **claude-slack-bridge full-process plugin**. This is a one-time-per-repo configuration flow. It does NOT start a feature — it only writes the template, optional helper skill, and `.gitignore` entries that `/process` will need later.
 
-You are running inside a sub-Claude that the daemon spawned with:
-
-- `cwd` = the **main repo root** (the consumer project, not the bridge).
-- `env["SLACK_THREAD_TS"]` = the ts of the user's `/process-setup` message (already injected; the broker reads it automatically).
-- `env["SLACK_CHANNEL"]` = the channel id.
-
-All user-facing communication MUST go through `mcp__claude-slack-bridge__ask_on_slack`. Do not print prose to the terminal expecting the user to read it. From the very first `ask_on_slack` call onward, every clarification, confirmation, and final status update goes through Slack.
+You run **locally inside Claude Code** (not via the Slack daemon). All clarifications go through `AskUserQuestion`. Do not call `mcp__claude-slack-bridge__ask_on_slack` from this skill — Slack is only the runtime channel for `/process` itself, not for setup.
 
 The plugin and the daemon's workflow engine are **version-locked**. The template you write below has `version: 1`; the daemon checks this on every step spawn and refuses to advance if the version is unsupported. Do not invent a different version.
 
@@ -26,79 +20,128 @@ Before doing anything else, check whether `.claude/processes/active` exists in `
 ```python
 import os
 if os.path.exists(".claude/processes/active"):
-    # Tell the user via Slack and exit. Do NOT proceed.
+    # Print and exit. Do NOT proceed.
     ...
 ```
 
-If it exists, send this exact message via `ask_on_slack` (no answer needed — but `ask_on_slack` is the only Slack channel you have, so frame it as a notice the user can reply "ok" to) or simply post and then exit:
+If it exists, print this exact message and exit non-zero — do not write any files:
 
 > A feature is in progress. Run `/clean-process` first or wait for it to finish before re-configuring.
 
-Then exit cleanly. Do not write any files.
+---
+
+## Step 1 — verify `mcp__claude-slack-bridge` is installed in the repo
+
+Read `cwd/.mcp.json`. The file must exist and must contain a server entry whose key is `claude-slack-bridge` (the MCP tool prefix `mcp__claude-slack-bridge__*` is derived from this key).
+
+```python
+import json, os
+mcp_path = os.path.join(os.getcwd(), ".mcp.json")
+if not os.path.exists(mcp_path):
+    # hard fail — see message below
+    ...
+with open(mcp_path) as f:
+    cfg = json.load(f)
+if "claude-slack-bridge" not in (cfg.get("mcpServers") or {}):
+    # hard fail — see message below
+    ...
+```
+
+If either check fails, print this exact message and exit non-zero. Do not offer to write the entry yourself, do not continue:
+
+> `mcp__claude-slack-bridge` is not installed in this repo. Add a `claude-slack-bridge` entry under `mcpServers` in `.mcp.json` (see the project README for the exact docker-exec snippet), then re-run `/process-setup`.
+
+Do not check whether the bridge container is *running* — only that the repo declares the server. Runtime health is `/process`'s problem, not setup's.
 
 ---
 
-## Step 1 — detect the task manager
+## Step 2 — task manager: pick a manager
 
-Ask the user via `ask_on_slack`:
+Ask the user via `AskUserQuestion`:
 
-> Which task manager do you use for this repo? Reply with one of: `linear`, `jira`, `github`, `notion`, or `none`.
+> Which task manager do you use for this repo?
 
-If the answer is `none`, skip to Step 2 — do not write the helper skill.
+Options: `Linear`, `Jira`, `GitHub Issues`, `Notion`, `None / skip`.
 
-If the answer is one of `linear` / `jira` / `github` / `notion`:
+If the answer is **None / skip**, jump straight to Step 4 — do not write the helper skill, do not ask the integration questions.
 
-1. Read the template at the plugin's `templates/task-manager.md.tmpl`. The plugin path is the directory containing `plugin.json`; the template lives at `<plugin-root>/templates/task-manager.md.tmpl`. Use `${CLAUDE_PLUGIN_ROOT}` if set, otherwise resolve the plugin root by searching upward from this skill's directory.
-2. Substitute the placeholders:
-   - `{{TASK_MANAGER}}` → human label (`Linear`, `Jira`, `GitHub Issues`, `Notion`).
-   - `{{TASK_MANAGER_SLUG}}` → lowercase slug (`linear`, `jira`, `github`, `notion`).
-   - `{{CLI_OR_API_INSTRUCTIONS}}` → the right block from the table inside the template (the template has commented-out blocks for each manager — keep the matching one and delete the others).
-3. Create the directory `.claude/skills/list-tasks/` if missing and write the substituted text to `.claude/skills/list-tasks/SKILL.md`.
-
-The generated `list-tasks` skill is invoked by the `/process` clarification skill via the Skill tool to fetch the user's open tasks. Make sure the frontmatter `name` is `list-tasks`.
+Record:
+- `task_manager_label` — the human label (e.g. `Linear`, `GitHub Issues`).
+- `task_manager_slug` — lowercase slug (`linear`, `jira`, `github`, `notion`).
 
 ---
 
-## Step 2 — verify GitHub credentials inside the bridge container
+## Step 3 — task manager: how is it integrated, and where do tasks live
 
-You are running inside the bridge container (the daemon spawned you). Check, in this order:
+Now ask the user three follow-up questions (in this order, one `AskUserQuestion` call per question is fine, or batch into one call with multiple questions). All four integration methods are valid for every manager — including GitHub. Do **not** assume `gh` for github; the user may prefer the GitHub MCP server, a custom plugin, or direct REST.
 
-1. **`GH_TOKEN` env var.** `os.getenv("GH_TOKEN")` — if non-empty, you are good.
-2. **Mounted `~/.config/gh/`.** Check `os.path.exists(os.path.expanduser("~/.config/gh/hosts.yml"))` — if it exists, you are good.
-3. **`gh auth status`.** Run `gh auth status` via subprocess; exit code 0 means you are good.
+### 3a. Integration method
 
-If none succeed, send this exact message via `ask_on_slack` and exit without writing the template:
+> How is `{task_manager_label}` integrated in this environment?
 
-> GitHub auth missing. On your host machine run `gh auth login`, then either set `GH_TOKEN=$(gh auth token)` in your `.env` for the bridge or mount `~/.config/gh` into the container (see README). Re-run `/process-setup` once that's done.
+Options (single-select, in this order):
+1. **MCP server** — there is an MCP server providing task tools (e.g. `mcp__linear__list_issues`, `mcp__github__list_issues`).
+2. **CLI tool** — there is a CLI installed (e.g. `gh`, `linear-cli`, `jira-cli`).
+3. **Plugin / slash command** — there is a Claude plugin or slash command that lists tasks.
+4. **Direct API (curl)** — call the manager's HTTP API directly with credentials from env vars.
 
-Do not try to launch a browser-based OAuth flow inside the container — the user has no browser here.
+Record the choice as `integration_method` ∈ `{mcp, cli, plugin, api}`.
+
+### 3b. Concrete invocation
+
+Based on the chosen method, ask one targeted follow-up via `AskUserQuestion` (use the free-text "Other" channel — these answers are repo-specific):
+
+- **mcp** → "Which MCP tool should `list-tasks` call to fetch open tasks? (e.g. `mcp__linear__list_my_issues`)"
+- **cli** → "Which command should `list-tasks` run to fetch open tasks? Paste the full command including flags (e.g. `gh issue list --assignee @me --state open --limit 20 --json number,title,body`)."
+- **plugin** → "Which slash command or skill should `list-tasks` invoke? (e.g. `/my-tasks` or skill name `my-team-tasks`)"
+- **api** → "Which HTTP endpoint and auth env var(s) should `list-tasks` use? (e.g. `https://api.linear.app/graphql` with `LINEAR_API_KEY`)"
+
+Record as `integration_invocation` (free-text from the user).
+
+### 3c. Scope (project / team / workspace)
+
+> Which project, team, or workspace holds the tasks for this repo, and how does `list-tasks` scope its query to it? (e.g. Linear team `ENG`, Jira project `PROJ`, GitHub repo `acme/web`, Notion DB id `abc123…`. Include the filter/parameter name if relevant — e.g. `team=ENG`, `repo=acme/web`.)
+
+Record as `scope` (single free-text field — keep it open-ended; the user types whatever identifier their tool needs).
+
+### 3d. Confirm and write the helper skill
+
+Read the plugin template at `<plugin-root>/templates/task-manager.md.tmpl` (use `${CLAUDE_PLUGIN_ROOT}` if set, otherwise resolve by searching upward from this skill's directory until you find `plugin.json`).
+
+Substitute:
+- `{{TASK_MANAGER}}` → `task_manager_label`
+- `{{TASK_MANAGER_SLUG}}` → `task_manager_slug`
+- `{{INTEGRATION_METHOD}}` → `integration_method` (one of `mcp`, `cli`, `plugin`, `api`)
+- `{{INTEGRATION_INVOCATION}}` → `integration_invocation` (verbatim user reply)
+- `{{SCOPE}}` → `scope` (verbatim user reply)
+
+Create `.claude/skills/list-tasks/` if missing and write the substituted text to `.claude/skills/list-tasks/SKILL.md`. Use atomic write (`.SKILL.md.tmp` → `os.replace`).
+
+The generated `list-tasks` skill is invoked by the `/process` clarification skill via the Skill tool. The frontmatter `name` must be `list-tasks`.
 
 ---
 
-## Step 3 — ask for the workflow steps
+## Step 4 — ask for the workflow steps
 
-Send this via `ask_on_slack`:
+Ask via `AskUserQuestion` (free-text reply expected via "Other"):
 
-> What are your workflow steps and the slash commands to run for each? The default is: `/design /plan /execute /create-pr /test`. Reply `default` to accept, or send a space-separated list of slash commands in order (e.g. `/design /plan /execute /create-pr /test`).
+> What are your workflow steps and the slash commands to run for each? Default: `/design /plan /execute /create-pr /test`. Reply `default` to accept, or paste a space-separated list of slash commands in order.
 
-If the user replies `default` (case-insensitive) or returns the default list, use the default.
+Parse the reply into ordered step entries. For each `/foo`:
+- `name` = `foo` (no leading slash)
+- `command` = `/foo` (with the leading slash, exactly as written)
 
-Otherwise, parse the user's reply into an ordered list of step entries. For each slash command `/foo`:
+Confirm the parsed list back to the user with another `AskUserQuestion`:
 
-- `name` = the command without the leading slash (`foo`).
-- `command` = the slash command exactly as the user wrote it, with the leading `/`.
+> I'll configure these steps in order: `<step1> -> <step2> -> ...`. Confirm?
 
-Confirm the parsed list back to the user with `ask_on_slack`:
-
-> I'll configure these steps in order: `<step1> -> <step2> -> ...`. Reply `yes` to write the template, or send a corrected space-separated list.
-
-Loop until the user replies `yes`.
+Options: `Yes, write it` / `Let me edit` (free-text). Loop until confirmed.
 
 ---
 
-## Step 4 — write `.claude/process-template.json`
+## Step 5 — write `.claude/process-template.json`
 
-Create `.claude/process-template.json` in `cwd` with this exact shape:
+Create `.claude/process-template.json` in `cwd` with this exact shape (steps replaced by the user's confirmed list):
 
 ```json
 {
@@ -114,13 +157,11 @@ Create `.claude/process-template.json` in `cwd` with this exact shape:
 }
 ```
 
-— but with the `steps` array replaced by the user's confirmed list. Always set `version: 1` and `branch_pattern: "feature/{slug}"`.
-
-Use atomic write (write to `.claude/process-template.json.tmp` then `os.replace` to the final path).
+Always set `version: 1` and `branch_pattern: "feature/{slug}"`. Use atomic write (`.claude/process-template.json.tmp` → `os.replace`).
 
 ---
 
-## Step 5 — append to `.gitignore`
+## Step 6 — append to `.gitignore`
 
 Read `cwd/.gitignore` if it exists. If `.claude/worktrees/` is not present as its own line, append it (with a leading newline if the file doesn't end in one). Same for `.claude/processes/`. If `.gitignore` doesn't exist, create it with these two lines.
 
@@ -128,21 +169,19 @@ Do not rewrite or reorder existing entries.
 
 ---
 
-## Step 6 — confirm in Slack
+## Step 7 — confirm
 
-Send this final message via `ask_on_slack` (you can phrase it as a "reply ok" to follow the tool contract, or just post and exit):
+Print a one-line summary to stdout and exit zero:
 
-> Setup complete. Post `/process` in this channel to start a feature.
+```
+process-setup complete (steps=N, task_manager=X, integration=Y)
+```
 
-Then exit zero with a short stdout summary like `process-setup complete (steps=N, task_manager=X)`.
+Where `X` is the slug (or `none`) and `Y` is the integration method (or `none`).
 
 ---
 
-## Communication rules (project CLAUDE.md)
-
-Once you call `ask_on_slack` for the first time in this skill, ALL further communication with the user must go through that tool. Do NOT use `AskUserQuestion`. Do NOT ask questions or print status to the terminal. Continue exclusively via Slack until you exit.
-
 ## Failure handling
 
-- Any unrecoverable error (e.g. unreadable plugin template, can't write `.claude/`, malformed user reply that doesn't recover after one retry) → post a short error message via `ask_on_slack` describing what went wrong and exit non-zero. Do not leave a half-written `.claude/process-template.json` (use atomic write).
+- Any unrecoverable error (e.g. unreadable plugin template, can't write `.claude/`, malformed user reply that doesn't recover after one retry) → print a short error describing what went wrong and exit non-zero. Do not leave a half-written `.claude/process-template.json` (use atomic write).
 - Do not catch and ignore exceptions silently.

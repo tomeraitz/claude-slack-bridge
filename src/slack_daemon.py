@@ -98,7 +98,12 @@ class SlackDaemon:
         # Case 2: Threaded reply with NO pending session — continue Claude conversation.
         if thread_ts:
             if thread_ts in self._active_threads:
+                logger.info("Skipping reply on already-active thread %s.", thread_ts)
                 return
+            logger.info(
+                "Flow B (thread reply): channel=%s thread_ts=%s text=%r",
+                channel, thread_ts, text[:120],
+            )
             asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
             return
 
@@ -112,7 +117,12 @@ class SlackDaemon:
 
         message_ts: str = event.get("ts", "")
         if message_ts in self._active_threads:
+            logger.info("Skipping mention on already-active message %s.", message_ts)
             return
+        logger.info(
+            "Flow B (new mention): channel=%s message_ts=%s text=%r",
+            channel, message_ts, text[:120],
+        )
         asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text))
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:

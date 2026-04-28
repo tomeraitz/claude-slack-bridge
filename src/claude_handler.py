@@ -14,15 +14,22 @@ the channel to a project path and runs ``claude -p`` from that directory so
 Claude sees the project's CLAUDE.md and codebase.
 
 Each entry in ``projects.json`` can be a plain path string (legacy) or a dict
-with ``path`` and an optional ``plugin_dir`` field.  When ``plugin_dir`` is
-set, ``--plugin-dir <dir>`` is prepended to the ``claude -p`` invocation so
-that project-specific skills are loaded automatically.
+with ``path`` and optional ``plugin_dir`` / ``worktrees`` fields. When
+``plugin_dir`` is set, ``--plugin-dir <dir>`` is prepended to the
+``claude -p`` invocation so project-specific skills are loaded automatically.
+
+When ``worktrees`` is a ``{label: path}`` map, users can route a top-level
+Slack message to a specific worktree by prefixing the message with
+``[label]`` (e.g. ``@Bot [feature-x] refactor session.py``). The label
+prefix is stripped before the prompt is sent to Claude. Replies inside the
+resulting thread stay in that worktree without re-tagging.
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -31,6 +38,60 @@ logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
 PROJECTS_CONFIG = Path(__file__).parent.parent / "projects.json"
+
+# Allow Slack's leading bold/italic/strike markers (``*``, ``_``, ``~``)
+# before the tag — Slack delivers ``*[label] msg*`` when the user bolds
+# the whole line.
+_WORKTREE_TAG_RE = re.compile(r"^[\s*_~]*\[([^\]]+)\]\s*")
+# Labels become directory names; restrict to a safe alphabet to block
+# path-traversal attempts like ``[../etc]``.
+_SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _parse_worktree_tag(text: str) -> tuple[str | None, str]:
+    """Strip a leading ``[label]`` tag from *text*.
+
+    Returns ``(label, remaining_text)``. ``label`` is ``None`` when no tag
+    is present or when the label contains unsafe characters. The label is
+    what users type in Slack to route a Flow-B message to a specific
+    worktree (e.g. ``[claude-slack-test] hi``).
+    """
+    match = _WORKTREE_TAG_RE.match(text)
+    if not match:
+        logger.info("No worktree tag in message: %r", text[:80])
+        return None, text
+    label = match.group(1).strip()
+    if not _SAFE_LABEL_RE.match(label):
+        logger.warning("Rejecting worktree label with unsafe chars: %r", label)
+        return None, text
+    remaining = text[match.end() :]
+    logger.info("Parsed worktree tag: label=%r, remaining=%r", label, remaining[:80])
+    return label, remaining
+
+
+def _resolve_dynamic_worktree(default_path: str, label: str) -> str | None:
+    """Resolve *label* to a sibling worktree directory of *default_path*.
+
+    Worktrees are typically created with ``git worktree add ../<name>`` so
+    they live next to the main checkout. This lets users add/remove
+    worktrees without editing ``projects.json``: the daemon checks whether
+    a sibling directory named *label* exists and looks like a git checkout
+    (has a ``.git`` file or directory).
+
+    Returns the resolved path or ``None`` if no matching directory exists.
+    """
+    parent = os.path.dirname(default_path)
+    candidate = os.path.join(parent, label)
+    git_marker = os.path.join(candidate, ".git")
+    dir_exists = os.path.isdir(candidate)
+    git_exists = os.path.exists(git_marker)
+    logger.info(
+        "Dynamic worktree probe: candidate=%s dir_exists=%s git_marker_exists=%s",
+        candidate, dir_exists, git_exists,
+    )
+    if dir_exists and git_exists:
+        return candidate
+    return None
 
 
 def _load_project_map() -> dict[str, Any]:
@@ -61,8 +122,12 @@ class ClaudeHandler:
         self._bot_user_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._project_map: dict[str, Any] = _load_project_map()
-        # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None}
+        # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None,
+        #                                    "worktrees": dict[str, str]}
         self._channel_id_to_project: dict[str, dict] = {}
+        # thread_ts → (cwd, plugin_dir) chosen when the thread started, so
+        # replies stay in the same worktree without re-tagging.
+        self._thread_config: dict[str, tuple[str | None, str | None]] = {}
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID and resolve channel names to IDs."""
@@ -79,18 +144,27 @@ class ClaudeHandler:
 
     async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
+        label, text = _parse_worktree_tag(text)
+        project_dir, plugin_dir = self._get_project_config(channel, label)
+
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
-        logger.info("New Claude session %s for thread %s", session_id, message_ts)
+        self._thread_config[message_ts] = (project_dir, plugin_dir)
+        logger.info(
+            "New Claude session %s for thread %s (label=%r, cwd=%s)",
+            session_id, message_ts, label, project_dir,
+        )
 
-        project_dir, plugin_dir = self._get_project_config(channel)
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
         return await self._run_claude(cmd, text, cwd=project_dir)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
-        project_dir, plugin_dir = self._get_project_config(channel)
+        # Thread inherits the worktree chosen at start; re-tagging mid-thread
+        # would be confusing, so we don't re-parse here. Falls back to default
+        # config only if the thread state was lost (container restart).
+        project_dir, plugin_dir = self._thread_config.get(thread_ts) or self._get_project_config(channel)
 
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
@@ -107,23 +181,49 @@ class ClaudeHandler:
     # Internals
     # ------------------------------------------------------------------
 
-    def _get_project_config(self, channel_id: str) -> tuple[str | None, str | None]:
+    def _get_project_config(
+        self, channel_id: str, label: str | None = None
+    ) -> tuple[str | None, str | None]:
         """Return (project_dir, plugin_dir) for a Slack channel ID.
+
+        When *label* is provided and matches a registered worktree for the
+        channel, the worktree path is returned instead of the default. An
+        unknown label falls back to the default with a warning so messages
+        aren't silently dropped.
 
         Both values are ``None`` when no mapping exists for the channel.
         """
         config = self._channel_id_to_project.get(channel_id)
-        if config:
-            path = config["path"]
-            plugin_dir = config["plugin_dir"]
-            logger.info(
-                "Channel %s → project %s%s",
-                channel_id, path,
-                f" (plugin_dir={plugin_dir})" if plugin_dir else "",
-            )
+        if not config:
+            logger.info("No project mapping for channel %s — using default cwd.", channel_id)
+            return None, None
+
+        plugin_dir = config["plugin_dir"]
+        worktrees: dict[str, str] = config.get("worktrees", {})
+        default_path = config["path"]
+
+        if label and label in worktrees:
+            path = worktrees[label]
+            logger.info("Channel %s [%s] → registered worktree %s", channel_id, label, path)
             return path, plugin_dir
-        logger.info("No project mapping for channel %s — using default cwd.", channel_id)
-        return None, None
+
+        if label and default_path:
+            dynamic = _resolve_dynamic_worktree(default_path, label)
+            if dynamic:
+                logger.info("Channel %s [%s] → dynamic worktree %s", channel_id, label, dynamic)
+                return dynamic, plugin_dir
+            logger.warning(
+                "Channel %s: no worktree directory found for label %r — using default.",
+                channel_id, label,
+            )
+
+        path = default_path
+        logger.info(
+            "Channel %s → project %s%s",
+            channel_id, path,
+            f" (plugin_dir={plugin_dir})" if plugin_dir else "",
+        )
+        return path, plugin_dir
 
     async def _resolve_channel_ids(self) -> None:
         """Resolve channel names from project_map to Slack channel IDs."""
@@ -140,11 +240,15 @@ class ClaudeHandler:
                 name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
 
             for channel_key, value in self._project_map.items():
-                # Normalise both the legacy string format and the new dict format.
+                # Normalise the legacy string format and the dict format.
                 if isinstance(value, str):
-                    config = {"path": value, "plugin_dir": None}
+                    config = {"path": value, "plugin_dir": None, "worktrees": {}}
                 else:
-                    config = {"path": value.get("path"), "plugin_dir": value.get("plugin_dir")}
+                    config = {
+                        "path": value.get("path"),
+                        "plugin_dir": value.get("plugin_dir"),
+                        "worktrees": value.get("worktrees") or {},
+                    }
 
                 # DM channel IDs (D...) and raw channel IDs (C...) are not
                 # returned by conversations_list — register them directly.
@@ -171,13 +275,32 @@ class ClaudeHandler:
         except Exception as exc:
             logger.error("Failed to resolve channel IDs: %s", exc)
 
+    # Flow-B Claude runs inside the bridge container; it has no docker CLI,
+    # so the project's .mcp.json (which spawns session.py via ``docker exec``)
+    # can't load. ``--strict-mcp-config`` blocks the failed startup, but Claude
+    # still reads .mcp.json and CLAUDE.md as text and reasons aloud about the
+    # missing slack-bridge tool. The system-prompt addendum tells it to skip
+    # that meta-commentary and just answer the user.
+    _FLOW_B_SYSTEM_PROMPT = (
+        "You are replying to a Slack message; your response is posted directly "
+        "into the Slack thread. Do not call any MCP tools and do not mention "
+        "MCP, tool availability, Docker, or the claude-slack-bridge in your "
+        "reply — just answer the user's message."
+    )
+
     @staticmethod
     def _build_cmd(
         session_id: str | None = None,
         resume: str | None = None,
         plugin_dir: str | None = None,
     ) -> list[str]:
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        cmd = [
+            "claude", "-p",
+            "--dangerously-skip-permissions",
+            "--strict-mcp-config",
+            "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
+            "--output-format", "json",
+        ]
         if plugin_dir:
             cmd.extend(["--plugin-dir", plugin_dir])
         if session_id:
@@ -193,6 +316,9 @@ class ClaudeHandler:
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
         for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(_key, None)
+
+        logger.info("Spawning Claude: cwd=%s prompt=%r", cwd, prompt[:120])
+        logger.info("Spawning Claude: cmd=%s", cmd)
 
         try:
             process = await asyncio.create_subprocess_exec(

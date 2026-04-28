@@ -7,11 +7,32 @@ point retains full control over the server lifecycle.
 """
 
 import logging
+from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import unquote, urlparse
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 logger = logging.getLogger(__name__)
+
+
+async def _derive_worktree_label(ctx: Context) -> str | None:
+    """
+    Return the basename of the client's first MCP root, or None.
+
+    The label is used to tag Slack posts so a user juggling multiple
+    worktree sessions in one channel can tell threads apart.
+    """
+    try:
+        roots = await ctx.list_roots()
+    except Exception as exc:
+        logger.debug("list_roots() unavailable: %s", exc)
+        return None
+    if not roots:
+        return None
+    path = unquote(urlparse(str(roots[0].uri)).path)
+    name = PurePosixPath(path).name
+    return name or None
 
 
 class MCPServer:
@@ -41,7 +62,7 @@ class MCPServer:
         mcp.tool()(self.ask_on_slack)
         logger.info("Registered 'ask_on_slack' tool on MCP server.")
 
-    async def ask_on_slack(self, message: str) -> str:
+    async def ask_on_slack(self, message: str, ctx: Context) -> str:
         """
         Post a message to Slack and wait for a human reply.
 
@@ -59,5 +80,6 @@ class MCPServer:
             RuntimeError: If no reply is received within 5 minutes.
         """
         logger.info("ask_on_slack called with message: %r", message)
-        reply = await self._broker.send_and_wait(message)
+        label = await _derive_worktree_label(ctx)
+        reply = await self._broker.send_and_wait(message, label)
         return reply

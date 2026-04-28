@@ -58,14 +58,11 @@ def _parse_worktree_tag(text: str) -> tuple[str | None, str]:
     """
     match = _WORKTREE_TAG_RE.match(text)
     if not match:
-        logger.info("No worktree tag in message: %r", text[:80])
         return None, text
     label = match.group(1).strip()
     if not _SAFE_LABEL_RE.match(label):
-        logger.warning("Rejecting worktree label with unsafe chars: %r", label)
         return None, text
     remaining = text[match.end() :]
-    logger.info("Parsed worktree tag: label=%r, remaining=%r", label, remaining[:80])
     return label, remaining
 
 
@@ -83,13 +80,7 @@ def _resolve_dynamic_worktree(default_path: str, label: str) -> str | None:
     parent = os.path.dirname(default_path)
     candidate = os.path.join(parent, label)
     git_marker = os.path.join(candidate, ".git")
-    dir_exists = os.path.isdir(candidate)
-    git_exists = os.path.exists(git_marker)
-    logger.info(
-        "Dynamic worktree probe: candidate=%s dir_exists=%s git_marker_exists=%s",
-        candidate, dir_exists, git_exists,
-    )
-    if dir_exists and git_exists:
+    if os.path.isdir(candidate) and os.path.exists(git_marker):
         return candidate
     return None
 
@@ -150,10 +141,7 @@ class ClaudeHandler:
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
         self._thread_config[message_ts] = (project_dir, plugin_dir)
-        logger.info(
-            "New Claude session %s for thread %s (label=%r, cwd=%s)",
-            session_id, message_ts, label, project_dir,
-        )
+        logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
         return await self._run_claude(cmd, text, cwd=project_dir)
@@ -203,19 +191,12 @@ class ClaudeHandler:
         default_path = config["path"]
 
         if label and label in worktrees:
-            path = worktrees[label]
-            logger.info("Channel %s [%s] → registered worktree %s", channel_id, label, path)
-            return path, plugin_dir
+            return worktrees[label], plugin_dir
 
         if label and default_path:
             dynamic = _resolve_dynamic_worktree(default_path, label)
             if dynamic:
-                logger.info("Channel %s [%s] → dynamic worktree %s", channel_id, label, dynamic)
                 return dynamic, plugin_dir
-            logger.warning(
-                "Channel %s: no worktree directory found for label %r — using default.",
-                channel_id, label,
-            )
 
         path = default_path
         logger.info(
@@ -316,9 +297,6 @@ class ClaudeHandler:
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
         for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(_key, None)
-
-        logger.info("Spawning Claude: cwd=%s prompt=%r", cwd, prompt[:120])
-        logger.info("Spawning Claude: cmd=%s", cmd)
 
         try:
             process = await asyncio.create_subprocess_exec(

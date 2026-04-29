@@ -135,8 +135,6 @@ Do not move to Step 6 until the user picks option 1 or 4. Cap the loop at ~5 ret
 
 Now that the flow is verified, generate `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` from the plugin template.
 
-Read the plugin template at `<plugin-root>/templates/task-manager.md.tmpl` (use `${CLAUDE_PLUGIN_ROOT}` if set, otherwise resolve by searching upward from this skill's directory until you find `plugin.json`).
-
 Substitute:
 - `{{TASK_MANAGER}}` → `task_manager_label`
 - `{{TASK_MANAGER_SLUG}}` → `task_manager_slug`
@@ -148,7 +146,22 @@ Create `.claude/skills/claude-slack-bridge_list-tasks/` if missing and write the
 
 The generated `claude-slack-bridge_list-tasks` skill is invoked by the `/process` clarification skill via the Skill tool. The frontmatter `name` must be `claude-slack-bridge_list-tasks`.
 
-After writing, return with `status: "configured"`.
+---
+
+## Step 7 — run the generated skill end-to-end
+
+After writing the file, invoke the freshly written `claude-slack-bridge_list-tasks` skill via the Skill tool to confirm it actually works as a skill (not just as the loose calls from Step 5). This catches issues like wrong frontmatter `name`, the skill not being picked up, broken substitution, or the baked-in invocation/scope drifting from what Step 5 verified.
+
+Show the user a short preview of the result and ask via `AskUserQuestion`:
+
+> The generated `claude-slack-bridge_list-tasks` skill returned `{N}` task(s). Look right?
+
+Options:
+1. **Yes** — return with `status: "configured"`.
+2. **No, fix and retry** — diagnose (template substitution? scope? invocation?), edit `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` directly or loop back to Step 3/4, then re-run Step 7.
+3. **Skip** — return with `status: "skipped"` (and consider removing the half-broken helper skill file).
+
+Cap retries at ~3. Only return `status: "configured"` after the user confirms the generated skill works.
 
 ---
 

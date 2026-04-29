@@ -1,6 +1,6 @@
 ---
 name: build-task-manager
-description: "Set up the task manager for this repo end-to-end: pick a manager (Linear / Jira / GitHub Issues / Notion / None), pick an integration method (MCP / CLI / plugin / API), verify the chosen integration is installed (offering to help install, wait for the user, or skip), capture the concrete invocation and scope, smoke-test the fetch, and write `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` from the plugin template. Returns a status of `configured` (with task_manager_label, task_manager_slug, integration_method) or `skipped`. Use as the task-manager phase of /process-setup."
+description: "Set up the task manager for this repo end-to-end: pick a manager (Linear / Jira / GitHub Issues / Notion / None), pick an integration method (MCP / CLI / plugin / API), verify the chosen integration is installed (offering to help install, wait for the user, or skip), ask the user how to fetch their tasks and try it (suggesting likely configuration issues on failure), then write `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` and verify it runs end-to-end. Returns a status of `configured` (with task_manager_label, task_manager_slug, integration_method) or `skipped`. Use as the task-manager phase of /process-setup."
 ---
 
 # build-task-manager — set up the task manager and write the claude-slack-bridge_list-tasks helper
@@ -15,7 +15,7 @@ Return values the caller needs (printed as a fenced JSON block at the end of the
 - `status` — `configured` or `skipped`.
 - `task_manager_label`, `task_manager_slug`, `integration_method` — populated when `status == "configured"`; omitted otherwise.
 
-Do not skip ahead to writing the helper skill until Step 5 has verified the integration end-to-end.
+Do not skip ahead to writing the helper skill until Step 3 has actually fetched tasks successfully.
 
 ---
 
@@ -83,64 +83,58 @@ After install (or after the user says they've installed it themselves), re-run t
 
 ---
 
-## Step 3 — concrete invocation
+## Step 3 — find the tasks
 
-Based on the chosen method, ask one targeted follow-up via `AskUserQuestion` (use the free-text "Other" channel — these answers are repo-specific):
+Ask the user via `AskUserQuestion` (free-text "Other" channel) one open-ended question:
 
-- **mcp** → "Which MCP tool should `claude-slack-bridge_list-tasks` call to fetch open tasks? (e.g. `mcp__linear__list_my_issues`)"
-- **cli** → "Which command should `claude-slack-bridge_list-tasks` run to fetch open tasks? Paste the full command including flags (e.g. `gh issue list --assignee @me --state open --limit 20 --json number,title,body`)."
-- **plugin** → "Which slash command or skill should `claude-slack-bridge_list-tasks` invoke? (e.g. `/my-tasks` or skill name `my-team-tasks`)"
-- **api** → "Which HTTP endpoint and auth env var(s) should `claude-slack-bridge_list-tasks` use? (e.g. `https://api.linear.app/graphql` with `LINEAR_API_KEY`)"
+> How do I fetch the open tasks for this repo from `{task_manager_label}` via `{integration_method}`? Tell me everything I need: the tool/command/endpoint, the project/team/workspace, and any filters. Examples:
+> - mcp: "call `mcp__linear__list_my_issues` with team=ENG"
+> - cli: "run `gh issue list --repo acme/web --assignee @me --state open --json number,title,body`"
+> - plugin: "run `/my-tasks` for the `web` workspace"
+> - api: "POST `https://api.linear.app/graphql` with `LINEAR_API_KEY`, query my open issues in team ENG"
 
-Record as `integration_invocation` (free-text from the user).
+Record the full reply as `task_fetch_instructions` (free-text). Then **try it** based on `integration_method`:
 
----
+- **mcp** — invoke the MCP tool the user named with the args they described. If the arg shape is unclear, call with the obvious mapping and let the error guide a fix.
+- **cli** — run the exact command via Bash.
+- **plugin** — invoke the slash command or skill via the Skill tool.
+- **api** — issue the HTTP request via `curl` (or Python) using the env vars the user named.
 
-## Step 4 — scope (project / team / workspace)
+### If the call succeeded
 
-Ask via `AskUserQuestion`:
+Show a short preview (first 3 task titles or trimmed response). Ask via `AskUserQuestion`:
 
-> Which project, team, or workspace holds the tasks for this repo, and how does `claude-slack-bridge_list-tasks` scope its query to it? (e.g. Linear team `ENG`, Jira project `PROJ`, GitHub repo `acme/web`, Notion DB id `abc123…`. Include the filter/parameter name if relevant — e.g. `team=ENG`, `repo=acme/web`.)
-
-Record as `scope` (single free-text field — keep it open-ended; the user types whatever identifier their tool needs).
-
----
-
-## Step 5 — run the find-the-tasks flow together (verify before writing the skill)
-
-Do not write the helper skill yet. First, actually fetch tasks once using the values gathered so far (`integration_method` from Step 2, `integration_invocation` from Step 3, `scope` from Step 4). The goal is to (1) prove the integration works and (2) discover any missing scope/filter/auth before it's baked into the skill.
-
-Run the call that matches `integration_method`:
-
-- **mcp** — invoke the MCP tool named in `integration_invocation`, passing arguments derived from `scope`. If you're unsure which argument shape the tool expects, call it with the obvious mapping and let the error message guide a retry.
-- **cli** — run the exact command in `integration_invocation` via Bash. If `scope` includes a filter the command doesn't yet have (e.g. `team=ENG`), ask the user how to add it, then re-run.
-- **plugin** — invoke the slash command or skill via the Skill tool, passing `scope` as an argument if applicable.
-- **api** — issue the HTTP request via `curl` (or Python) using the env vars in `integration_invocation`. If a required env var is missing, surface it to the user before retrying.
-
-Show the user a short preview of what came back (e.g. the first 3 task titles, or the raw response trimmed). Then ask via `AskUserQuestion`:
-
-> I fetched `{N}` task(s) from `{task_manager_label}`. Does this look like the right list?
+> I fetched `{N}` task(s) from `{task_manager_label}`. Look right?
 
 Options:
-1. **Yes, that's my task list** — proceed to Step 6.
-2. **No, the scope/filter is wrong** — ask which field is wrong and loop back to Step 3 or Step 4 as appropriate, then re-run Step 5.
-3. **No, the call failed** — discuss the error with the user, fix the integration (may loop back to Step 2b for missing install, Step 3 for wrong invocation, or Step 4 for wrong scope), then re-run Step 5.
-4. **The list is empty but the call succeeded — write it anyway** — accept and proceed to Step 6. (Useful when the user has no open tasks right now but the integration is wired correctly.)
+1. **Yes** (or **empty but the call succeeded — write it anyway**) — proceed to Step 4.
+2. **No, fix and retry** — ask the user what to change, update `task_fetch_instructions`, re-try.
 
-Do not move to Step 6 until the user picks option 1 or 4. Cap the loop at ~5 retries; if it still doesn't work, offer to skip task manager integration (return with `status: "skipped"`).
+### If the call failed
+
+Show the user the error and **suggest the most likely cause** — usually configuration. Map the failure shape to a hypothesis:
+
+- **Auth / 401 / 403** → missing or wrong env var (e.g. `LINEAR_API_KEY`, `GITHUB_TOKEN`, `JIRA_API_TOKEN`). Ask the user to set it, then retry.
+- **404 / not found / empty for a known-non-empty list** → wrong scope (project/team id, repo path, workspace). Ask the user to correct.
+- **Tool / command / endpoint not found** → integration not actually installed; loop back to Step 2b.
+- **Schema / validation / "unknown argument"** → wrong arg shape for the tool/command. Show the error and ask the user to adjust the invocation.
+- **Network / DNS / timeout** → connectivity. Pause and retry once before escalating to the user.
+
+After the user adjusts, re-run the call. Cap the loop at ~5 retries; if it still doesn't work, offer `status: "skipped"`.
+
+Whatever instructions actually produced a successful fetch are what get baked into the helper skill in Step 4 — so do not move on until the call works (or the user accepts an empty-but-successful response).
 
 ---
 
-## Step 6 — confirm and write the helper skill
+## Step 4 — write the helper skill
 
-Now that the flow is verified, generate `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` from the plugin template.
+Now that the fetch works, generate `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` from the plugin template.
 
 Substitute:
 - `{{TASK_MANAGER}}` → `task_manager_label`
 - `{{TASK_MANAGER_SLUG}}` → `task_manager_slug`
 - `{{INTEGRATION_METHOD}}` → `integration_method` (one of `mcp`, `cli`, `plugin`, `api`)
-- `{{INTEGRATION_INVOCATION}}` → `integration_invocation` (verbatim user reply)
-- `{{SCOPE}}` → `scope` (verbatim user reply)
+- `{{TASK_FETCH_INSTRUCTIONS}}` → `task_fetch_instructions` (the exact instructions that worked in Step 3)
 
 Create `.claude/skills/claude-slack-bridge_list-tasks/` if missing and write the substituted text to `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`. Use atomic write (`.SKILL.md.tmp` → `os.replace`).
 
@@ -148,9 +142,9 @@ The generated `claude-slack-bridge_list-tasks` skill is invoked by the `/process
 
 ---
 
-## Step 7 — run the generated skill end-to-end
+## Step 5 — run the generated skill end-to-end
 
-After writing the file, invoke the freshly written `claude-slack-bridge_list-tasks` skill via the Skill tool to confirm it actually works as a skill (not just as the loose calls from Step 5). This catches issues like wrong frontmatter `name`, the skill not being picked up, broken substitution, or the baked-in invocation/scope drifting from what Step 5 verified.
+After writing the file, invoke the freshly written `claude-slack-bridge_list-tasks` skill via the Skill tool to confirm it actually works as a skill (not just as the loose calls from Step 3). This catches issues like wrong frontmatter `name`, the skill not being picked up, or broken template substitution.
 
 Show the user a short preview of the result and ask via `AskUserQuestion`:
 
@@ -158,7 +152,7 @@ Show the user a short preview of the result and ask via `AskUserQuestion`:
 
 Options:
 1. **Yes** — return with `status: "configured"`.
-2. **No, fix and retry** — diagnose (template substitution? scope? invocation?), edit `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` directly or loop back to Step 3/4, then re-run Step 7.
+2. **No, fix and retry** — diagnose (template substitution? wrong instructions baked in?), edit `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` directly or loop back to Step 3, then re-run Step 5.
 3. **Skip** — return with `status: "skipped"` (and consider removing the half-broken helper skill file).
 
 Cap retries at ~3. Only return `status: "configured"` after the user confirms the generated skill works.

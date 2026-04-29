@@ -111,28 +111,6 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 
 ---
 
-## Optional: `full-process` Plugin
-
-This repo also publishes a Claude Code plugin, **`full-process`**, that drives an end-to-end feature workflow (clarify → design → plan → execute → PR → test) over Slack using the bridge. It requires the bridge daemon to be running.
-
-### Install
-
-In any Claude Code project where the bridge is already wired up:
-
-```
-/plugin marketplace add tomeraitz/claude-slack-bridge
-/plugin install full-process@claude-slack-bridge
-```
-
-### Use
-
-1. In the consumer repo, post `/process-setup` in the Slack channel mapped to that repo. The plugin walks you through detecting your task manager, verifying GitHub auth, and writing `.claude/process-template.json`.
-2. Once setup is complete, post `/process` in the same channel to start a feature.
-
-The plugin will not function without `mcp__claude-slack-bridge__ask_on_slack` available — install the bridge first.
-
----
-
 ## Configuration
 
 ### `.env` (daemon — set once, shared across all projects)
@@ -322,6 +300,74 @@ from the workspace directory, so the skill's commands and `CLAUDE.md` are active
   }
 }
 ```
+
+---
+
+## Worktrees
+
+The bridge understands `git worktree` checkouts so you can drive multiple branches of the same project from a single Slack channel without juggling configs. Worktrees flow in **both directions**:
+
+- **Slack → Claude:** prefix a top-level message with `[<worktree>]` to route it to that worktree.
+- **Claude → Slack:** when Claude (running inside a worktree) calls `ask_on_slack`, the bridge tags the first Slack post with the worktree name so concurrent sessions in the same channel are easy to tell apart.
+
+### Calling a worktree from Slack
+
+When you tag the bot in a channel, prepend the worktree name in square brackets:
+
+```
+@claude-bot [feature-auth] add a unit test for the new login flow
+@claude-bot [hotfix] why is /healthz returning 500?
+```
+
+The bridge:
+
+1. Parses the leading `[label]` from the message.
+2. Looks for a directory named `<label>` *next to* the channel's default `path` and verifies it's a git checkout (has a `.git` file or directory).
+3. Strips the `[label]` prefix and runs `claude -p` from that worktree's directory — so Claude sees that branch's code, `CLAUDE.md`, and uncommitted changes.
+4. Locks the resulting Slack thread to that worktree. **Reply in the thread normally — no need to repeat the `[label]` prefix.**
+
+Slack formatting around the tag is tolerated, so `*[feature-auth]* fix login` (bolded by Slack) works the same as the plain version.
+
+Create worktrees with `git worktree add ../<label>` and they become routable instantly with no config edits. If the label doesn't resolve to a sibling git directory, the message falls back to the channel's default project path and a warning is logged — messages are never silently dropped.
+
+> **Security note:** labels are restricted to `[A-Za-z0-9._-]` so a crafted message like `[../etc]` cannot escape the project parent directory.
+
+### How Claude shows the worktree in replies
+
+When Claude calls `ask_on_slack` from a session running inside a worktree, the MCP server reads the client's first MCP root and uses its basename as the worktree label. That label is prepended (bolded) to the **first** message of the Slack thread:
+
+```
+*[feature-auth]* Should I overwrite the existing migration file or generate a new one?
+```
+
+Subsequent posts in the same thread are not re-tagged — the prefix is only there so you can tell threads apart at a glance when several worktrees are asking questions in the same channel. If the MCP client doesn't expose roots (or none are set), the message is posted untagged.
+
+### Example workflow
+
+```bash
+# In your project repo:
+git worktree add ../myproject-feature-auth feature/auth
+git worktree add ../myproject-hotfix       hotfix/login-500
+```
+
+In Slack:
+
+```
+You:        @claude-bot [myproject-feature-auth] write a test for the new login redirect
+Claude-bot: *[myproject-feature-auth]* I've added tests/auth/test_login_redirect.py — want
+            me to also cover the failure path?
+You:        (reply in thread) yes, and run the suite to confirm
+```
+
+Meanwhile in the same channel:
+
+```
+You:        @claude-bot [myproject-hotfix] what's causing /healthz to 500?
+Claude-bot: *[myproject-hotfix]* The healthcheck imports a module renamed in main but
+            not yet on this branch. ...
+```
+
+Both threads run independently, each in its own worktree, with no config changes needed beyond `git worktree add`.
 
 ---
 

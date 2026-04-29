@@ -22,9 +22,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
-from projects import ProjectResolver
 from security import AccessControl, SecurityConfig
-from workflow import WorkflowEngine
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +47,6 @@ class SlackDaemon:
         self._pending: dict[str, asyncio.StreamWriter] = {}
         self._lock = asyncio.Lock()
         self._claude = ClaudeHandler(slack_client=self._app.client)
-        self._resolver = ProjectResolver()
-        self._workflow = WorkflowEngine(
-            slack_client=self._app.client,
-            post_response=self._post_response,
-            resolver=self._resolver,
-        )
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
 
@@ -85,18 +77,6 @@ class SlackDaemon:
 
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
-        text_stripped = text.strip()
-        process_thread = thread_ts is not None and self._workflow.is_active_thread(thread_ts)
-
-        # Strip @bot mention from text for /process detection (top-level posts may be @-prefixed)
-        mention_tag = f"<@{self._bot_user_id}>"
-        text_no_mention = text.replace(mention_tag, "").strip()
-
-        # Case 0: /clean-process is an emergency stop — must reach the workflow
-        # engine even if a step sub-Claude is currently blocked on ask_on_slack.
-        if process_thread and text_stripped == "/clean-process":
-            asyncio.create_task(self._workflow.handle_clean_process(thread_ts))
-            return
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -115,20 +95,6 @@ class SlackDaemon:
                     writer.close()
                 return
 
-        # Case 1.5: thread is on the active /process registry, no pending session.
-        if process_thread:
-            if text_stripped == "/next-task":
-                asyncio.create_task(self._workflow.handle_next_task(thread_ts))
-                return
-            if text_stripped.startswith("/reject"):
-                reason = text_stripped[len("/reject"):].strip()
-                asyncio.create_task(self._workflow.handle_reject(thread_ts, reason))
-                return
-            # Free text in /process thread (waiting_approval echo, running_step queueing,
-            # failed-state preserve). Engine decides per phase.
-            asyncio.create_task(self._workflow.handle_thread_message(thread_ts, text))
-            return
-
         # Case 2: Threaded reply with NO pending session — continue Claude conversation.
         if thread_ts:
             if thread_ts in self._active_threads:
@@ -136,13 +102,8 @@ class SlackDaemon:
             asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
             return
 
-        # Case 3 (TOP-LEVEL): /process detection BEFORE @-mention check.
-        # `/process` may be invoked plain or as `@bot /process`. Accept both.
-        if text_no_mention == "/process":
-            asyncio.create_task(self._handle_process_start(channel, event.get("ts", ""), user_id))
-            return
-
-        # Case 3 fallback: only respond if @-mentioned.
+        # Case 3: Top-level message — only respond if the bot is mentioned.
+        mention_tag = f"<@{self._bot_user_id}>"
         if mention_tag not in text:
             return
 
@@ -196,88 +157,6 @@ class SlackDaemon:
         finally:
             self._active_threads.discard(thread_ts)
 
-    async def _handle_process_start(self, channel: str, message_ts: str, user_id: str) -> None:
-        """Handle a top-level /process post: admit + spawn clarification sub-Claude."""
-        project_dir, plugin_dir = self._resolver.get_project_config(channel)
-        if not project_dir:
-            await self._post_response(
-                channel, message_ts,
-                "/process requires a project mapping for this channel. "
-                "Add this channel to projects.json.",
-            )
-            return
-
-        admitted = await self._workflow.admit_process_start(channel, project_dir, message_ts)
-        if not admitted:
-            await self._post_response(
-                channel, message_ts,
-                "A process is active — finish it or post `/clean-process`.",
-            )
-            return
-
-        # Spawn the clarification sub-Claude. cwd = main repo, env carries thread+channel.
-        asyncio.create_task(
-            self._spawn_clarification(channel, message_ts, project_dir, plugin_dir)
-        )
-
-    async def _spawn_clarification(
-        self,
-        channel: str,
-        message_ts: str,
-        project_dir: str,
-        plugin_dir: str | None,
-    ) -> None:
-        """Spawn the clarification sub-Claude that drives the /process skill.
-
-        The subprocess is responsible for sending ``START <worktree>`` over the
-        Unix socket itself once it has written ``process.json`` and the active
-        marker — this method does not advance workflow state.
-        """
-        cmd = [
-            "claude", "-p",
-            "--mcp-config", "/app/mcp.in-container.json",
-            "--strict-mcp-config",
-            "--dangerously-skip-permissions",
-            "--output-format", "json",
-        ]
-        if plugin_dir:
-            cmd.extend(["--plugin-dir", plugin_dir])
-
-        prompt = "Run the `/process` clarification skill for a new feature."
-
-        env = os.environ.copy()
-        for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
-            env.pop(_key, None)
-        env["SLACK_THREAD_TS"] = message_ts
-        env["SLACK_CHANNEL"] = channel
-        # NOTE: STEP_NAME is NOT set for clarification — only step sub-Claudes get it.
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=project_dir,
-            )
-            stdout_bytes, stderr_bytes = await process.communicate(input=prompt.encode("utf-8"))
-            if process.returncode != 0:
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-                logger.error(
-                    "Clarification sub-Claude failed (rc=%d): %s",
-                    process.returncode, stderr_text[:1000],
-                )
-                await self._post_response(
-                    channel, message_ts,
-                    "Clarification step failed — see daemon logs. /clean-process to reset.",
-                )
-        except FileNotFoundError:
-            logger.error("claude CLI not found")
-            await self._post_response(channel, message_ts, "Claude CLI not available.")
-        except Exception as exc:
-            logger.error("Clarification spawn error: %s", exc)
-
     async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
         """Post a response to Slack, splitting if it exceeds the message length limit."""
         if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
@@ -299,29 +178,20 @@ class SlackDaemon:
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=10.0)
             parts = line.decode().strip().split(" ", 1)
-            verb = parts[0] if parts else ""
 
-            if verb == "REGISTER" and len(parts) == 2:
-                thread_ts = parts[1]
-                async with self._lock:
-                    self._pending[thread_ts] = writer
-
-                logger.info("Session registered for thread %s.", thread_ts)
-
-                # Block until the session disconnects (reader.read returns b"" on close).
-                # This ensures _pending is cleaned up if the session exits before a reply arrives.
-                await reader.read(1)
-            elif verb == "START" and len(parts) == 2:
-                worktree_path = parts[1]
-                logger.info("Workflow START for worktree %s", worktree_path)
-                # The clarification sub-Claude has already written process.json and the
-                # active marker; we just hand off to the engine.
-                asyncio.create_task(self._workflow.handle_start_verb(worktree_path))
-                # Close the socket immediately — the clarification skill doesn't wait for a reply.
-                return
-            else:
+            if len(parts) != 2 or parts[0] != "REGISTER":
                 logger.warning("Bad session registration: %r", line)
                 return
+
+            thread_ts = parts[1]
+            async with self._lock:
+                self._pending[thread_ts] = writer
+
+            logger.info("Session registered for thread %s.", thread_ts)
+
+            # Block until the session disconnects (reader.read returns b"" on close).
+            # This ensures _pending is cleaned up if the session exits before a reply arrives.
+            await reader.read(1)
 
         except Exception as exc:
             logger.error("Session connection error: %s", exc)
@@ -336,9 +206,6 @@ class SlackDaemon:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
-
-        await self._resolver.resolve(self._app.client)
-        await self._workflow.recover_on_startup()
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)

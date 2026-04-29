@@ -8,7 +8,6 @@ OS-level blocking I/O of asyncio Unix sockets — no polling.
 
 import asyncio
 import logging
-import os
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 
-PostMessageFn = Callable[[str, str | None], Coroutine[Any, Any, str]]
+PostMessageFn = Callable[[str, str | None, str | None], Coroutine[Any, Any, str]]
 
 
 class SessionBroker:
@@ -33,15 +32,16 @@ class SessionBroker:
         self._post_message = post_message
         self._timeout = timeout_minutes * 60.0
         self._thread_ts: str | None = None
-        self._thread_ts = os.getenv("SLACK_THREAD_TS") or None
-        self._step_name: str | None = os.getenv("STEP_NAME") or None
 
-    async def send_and_wait(self, message: str) -> str:
+    async def send_and_wait(self, message: str, label: str | None = None) -> str:
         """
         Post *message* to Slack and wait for the daemon to deliver the reply.
 
         Args:
             message: The text to post to the Slack channel.
+            label:   Optional worktree tag — prepended to the first post in the
+                     thread so multiple worktree sessions sharing a channel
+                     can be told apart visually.
 
         Returns:
             The text of the first human reply received.
@@ -49,9 +49,7 @@ class SessionBroker:
         Raises:
             RuntimeError: If no reply arrives within the configured timeout.
         """
-        if self._step_name and not message.startswith(f"[Step: {self._step_name}]"):
-            message = f"[Step: {self._step_name}] " + message
-        thread_ts = await self._post_message(message, self._thread_ts)
+        thread_ts = await self._post_message(message, self._thread_ts, label)
         if self._thread_ts is None:
             self._thread_ts = thread_ts
         logger.info("Posted message, awaiting reply on thread %s.", thread_ts)

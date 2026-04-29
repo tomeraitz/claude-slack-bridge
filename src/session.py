@@ -37,7 +37,13 @@ async def run(config: Config) -> None:
     """
     app = AsyncApp(token=config.slack_bot_token)
 
-    async def post_message(text: str, thread_ts: str | None = None) -> str:
+    async def post_message(
+        text: str,
+        thread_ts: str | None = None,
+        label: str | None = None,
+    ) -> str:
+        if thread_ts is None and label:
+            text = f"*[{label}]* {text}"
         kwargs: dict = dict(
             channel=config.slack_channel,
             text=f"<!channel> {text}",

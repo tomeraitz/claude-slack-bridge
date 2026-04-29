@@ -8,7 +8,7 @@ description: "Set up the task manager for this repo end-to-end: pick a manager (
 You run **locally inside Claude Code** (not via the Slack daemon). All clarifications go through `AskUserQuestion`. Do not call `mcp__claude-slack-bridge__ask_on_slack` from this skill.
 
 This skill is the entire task-manager phase of `/process-setup`. By the time it returns, either:
-- The user picked a manager, the integration is verified, the smoke-test succeeded, and `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` has been written from the plugin template (status: `configured`); or
+- The user picked a manager, the integration is verified, the smoke-test succeeded, and `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` has been generated (status: `configured`); or
 - The user skipped (or aborted the install flow after retries), no helper skill was written (status: `skipped`).
 
 Return values the caller needs (printed as a fenced JSON block at the end of the final reply):
@@ -93,6 +93,8 @@ Ask the user via `AskUserQuestion` (free-text "Other" channel) one open-ended qu
 > - plugin: "run `/my-tasks` for the `web` workspace"
 > - api: "POST `https://api.linear.app/graphql` with `LINEAR_API_KEY`, query my open issues in team ENG"
 
+**Prefer search / name-based filters over internal ids.** When the user offers a filter, push for the human-readable form (project name, team key, status name, assignee email/handle, repo `owner/name`) rather than an opaque uuid or numeric id. Ids drift, get re-issued, and are unreadable in the baked-in skill; names survive. Only fall back to an id if the manager genuinely doesn't expose a stable name-based filter for that field. If the user's first reply uses ids, ask once whether an equivalent name/key filter exists before recording.
+
 Record the full reply as `task_fetch_instructions` (free-text). Then **try it** based on `integration_method`:
 
 - **mcp** — invoke the MCP tool the user named with the args they described. If the arg shape is unclear, call with the obvious mapping and let the error guide a fix.
@@ -128,17 +130,43 @@ Whatever instructions actually produced a successful fetch are what get baked in
 
 ## Step 4 — write the helper skill
 
-Now that the fetch works, generate `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` from the plugin template.
+Now that the fetch works, generate `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md` directly (no external template — write the file from scratch using the values you collected).
 
-Substitute:
-- `{{TASK_MANAGER}}` → `task_manager_label`
-- `{{TASK_MANAGER_SLUG}}` → `task_manager_slug`
-- `{{INTEGRATION_METHOD}}` → `integration_method` (one of `mcp`, `cli`, `plugin`, `api`)
-- `{{TASK_FETCH_INSTRUCTIONS}}` → `task_fetch_instructions` (the exact instructions that worked in Step 3)
+Create `.claude/skills/claude-slack-bridge_list-tasks/` if missing, then write `SKILL.md` with this exact shape (atomic write: `.SKILL.md.tmp` → `os.replace`):
 
-Create `.claude/skills/claude-slack-bridge_list-tasks/` if missing and write the substituted text to `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`. Use atomic write (`.SKILL.md.tmp` → `os.replace`).
+```markdown
+---
+name: claude-slack-bridge_list-tasks
+description: "List the open tasks assigned to the current user from {task_manager_label} via {integration_method}. Returns a list of task names only (no ids, URLs, or descriptions) for the /process clarification skill."
+---
 
-The generated `claude-slack-bridge_list-tasks` skill is invoked by the `/process` clarification skill via the Skill tool. The frontmatter `name` must be `claude-slack-bridge_list-tasks`.
+# claude-slack-bridge_list-tasks — fetch open tasks from {task_manager_label}
+
+This skill is invoked by the `/process` clarification skill via the Skill tool. Its only job is to fetch the current user's open tasks from {task_manager_label} and return their names.
+
+## How to fetch
+
+Task manager: **{task_manager_label}** (`{task_manager_slug}`)
+Integration method: **{integration_method}**
+
+Run the following exactly as recorded during `/process-setup`:
+
+{task_fetch_instructions}
+
+## Output
+
+Return **only the task names / titles**, one per line. Do not include ids, keys, numbers, URLs, descriptions, status, assignees, or any other metadata — just the names.
+
+If the fetch returns zero tasks, say so explicitly rather than returning an empty response. If the fetch fails, surface the error verbatim — do not silently swallow it; the caller needs to know the integration broke.
+```
+
+Substitute the values inline as you write the file (do not leave `{task_manager_label}` etc. literally in the output):
+- `{task_manager_label}` → the label from Step 1 (e.g. `Linear`)
+- `{task_manager_slug}` → the slug from Step 1 (e.g. `linear`)
+- `{integration_method}` → from Step 2a (`mcp` / `cli` / `plugin` / `api`)
+- `{task_fetch_instructions}` → the exact instructions from Step 3 that produced a successful fetch (preserve formatting — code fences, command lines, tool names)
+
+The frontmatter `name` must be exactly `claude-slack-bridge_list-tasks` so the `/process` skill can invoke it via the Skill tool.
 
 ---
 

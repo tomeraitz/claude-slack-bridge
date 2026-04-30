@@ -257,16 +257,16 @@ class ClaudeHandler:
             logger.error("Failed to resolve channel IDs: %s", exc)
 
     # Flow-B Claude runs inside the bridge container; it has no docker CLI,
-    # so the project's .mcp.json (which spawns session.py via ``docker exec``)
-    # can't load. ``--strict-mcp-config`` blocks the failed startup, but Claude
-    # still reads .mcp.json and CLAUDE.md as text and reasons aloud about the
-    # missing slack-bridge tool. The system-prompt addendum tells it to skip
-    # that meta-commentary and just answer the user.
+    # so the ``claude-slack-bridge`` entry in the project's .mcp.json (which
+    # spawns ``session.py`` via ``docker exec``) fails to start. Other MCP
+    # servers in .mcp.json (e.g. Notion) load normally. The system-prompt
+    # addendum tells Claude not to mention the failed bridge server in its
+    # reply.
     _FLOW_B_SYSTEM_PROMPT = (
         "You are replying to a Slack message; your response is posted directly "
-        "into the Slack thread. Do not call any MCP tools and do not mention "
-        "MCP, tool availability, Docker, or the claude-slack-bridge in your "
-        "reply — just answer the user's message."
+        "into the Slack thread. Do not mention MCP, tool availability, Docker, "
+        "or the claude-slack-bridge server in your reply — just answer the "
+        "user's message."
     )
 
     @staticmethod
@@ -278,7 +278,6 @@ class ClaudeHandler:
         cmd = [
             "claude", "-p",
             "--dangerously-skip-permissions",
-            "--strict-mcp-config",
             "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
             "--output-format", "json",
         ]

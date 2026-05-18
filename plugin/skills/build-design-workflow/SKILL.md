@@ -30,7 +30,15 @@ Ask via `AskUserQuestion`:
 
 Options:
 1. **Yes, set up the design step** — continue to Step 2.
-2. **No, skip it** — return immediately with `status: "skipped"` and `label: "design-workflow: skip"`. Do not write any files.
+2. **No, help me create one** — the user has no existing design process and wants one built inline. Record `has_existing_design_process = false`, `existing_design_reference = null`, `existing_design_path = null`. **Skip Step 2 entirely** and jump straight to the `design_kind` capture described below, then continue to Step 3.
+
+   Ask via `AskUserQuestion` (free-text reply via "Other"):
+
+   > What kind of design do you need this step to produce? Examples: a UX/UI design doc (user flows, wireframe descriptions), a system / architecture design (components, data flow, API contracts), a data-model design (schemas, migrations), an API design (endpoints, request/response shapes), or something else — describe it briefly.
+
+   Record the reply as `design_kind` (free-text), then continue to Step 3.
+
+3. **No, skip it** — return immediately with `status: "skipped"` and `label: "design-workflow: skip"`. Do not write any files.
 
 ---
 

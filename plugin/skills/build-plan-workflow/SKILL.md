@@ -1,6 +1,6 @@
 ---
 name: build-plan-workflow
-description: "Configure the plan phase of the /process workflow. Asks whether the user wants a plan step at all (skip-able), then asks whether they already have a planning process (e.g. an existing /plan command or skill). If they do, reads it and inspects whether it already saves the produced plan into the repo and already commits/pushes/opens a PR; whatever is missing gets added. If they don't, asks what kind of plan doc the step should produce and bakes that prompt directly into the wrapper. The ONLY file this skill writes is `.claude/skills/claude-slack-bridge_plan/SKILL.md` — a wrapper skill that runs the user's plan flow (`<@ref-plan-flow>`) or an inline plan prompt when none exists, saves the output under `.plan/` (creating the folder if missing), commits and pushes if the inner flow didn't, opens a GitHub PR, and sends a response back to the caller. Never scaffolds a separate `/plan` slash command. Returns a status of `configured` (with the captured reference + repo save path) or `skipped` (with the literal label `plan-workflow: skip`). Use as the plan-workflow phase of /process-setup."
+description: "Configure the plan phase of the /process workflow. Asks whether the user wants a plan step at all (skip-able), then asks whether they already have a planning process (e.g. an existing /plan command or skill). If they do, reads it and inspects whether it already commits/pushes/opens a PR; whatever is missing gets added. If they don't, asks what kind of plan doc the step should produce and bakes that prompt directly into the wrapper. The ONLY file this skill writes is `.claude/skills/claude-slack-bridge_plan/SKILL.md` — a wrapper skill that runs the user's plan flow (`<@ref-plan-flow>`) or an inline plan prompt when none exists, saves the output to the fixed path `.roadmap_features/<branch>/plan/feature_plan.md` (creating the folder if missing), commits and pushes if the inner flow didn't, opens a GitHub PR, and sends a response back to the caller. Never scaffolds a separate `/plan` slash command. Returns a status of `configured` (with the captured reference) or `skipped` (with the literal label `plan-workflow: skip`). Use as the plan-workflow phase of /process-setup."
 ---
 
 # build-plan-workflow — configure the /plan phase and write the claude-slack-bridge_plan wrapper
@@ -16,7 +16,8 @@ Return values the caller needs (printed as a fenced JSON block at the end of the
 - `label` — `plan-workflow: configured` when configured, `plan-workflow: skip` when skipped.
 - `has_existing_plan_process` — `true` / `false` (only present when configured).
 - `existing_plan_reference` — slash command or path to the user's existing plan flow (only when `has_existing_plan_process == true`).
-- `repo_plan_dir` — the folder inside the repo where the plan artifact will be saved (defaults to `.plan/`).
+
+The plan artifact is always saved to the fixed path `.roadmap_features/<branch>/plan/feature_plan.md`, where `<branch>` is the current git branch name. This is not configurable — do not ask the user where to save it.
 
 Do not skip ahead to writing the helper skill until Step 3 has actually captured everything it needs.
 
@@ -88,37 +89,32 @@ Options:
 This is the only file this skill ever writes. The wrapper's job at runtime is:
 
 1. **Produce the plan doc** — either invoke the user's existing plan flow (`{ref_plan_flow}`), or, when there is no existing flow, run an inline `{plan_kind}` plan prompt baked directly into this same skill.
-2. **Save the plan artifact in the repo** — write the produced markdown doc under `<repo_plan_dir>/<feature>.md`. Create `<repo_plan_dir>/` if it doesn't exist (default `.plan/`).
-3. **Commit and push if the inner flow didn't already** — `git add` the artifact, `git commit -m "plan: <feature>"`, `git push -u origin <branch>`. Skip this if the inner flow already committed + pushed.
-4. **Open a GitHub PR** — `gh pr create --base main --head <branch> --title "<feature>: plan" --body "..."`. If a PR already exists for the branch, update it instead.
+2. **Save the plan artifact in the repo** — always write the produced markdown doc to `.roadmap_features/<branch>/plan/feature_plan.md`, where `<branch>` is the current git branch name. Create the parent folders if they don't exist. This path is fixed and is NOT derived from inspecting the existing flow — if the inner flow wrote the doc somewhere else, the wrapper copies/moves it to the fixed path.
+3. **Commit and push if the inner flow didn't already** — `git add` the artifact, `git commit -m "plan: <branch>"`, `git push -u origin <branch>`. Skip this if the inner flow already committed + pushed.
+4. **Open a GitHub PR** — `gh pr create --base main --head <branch> --title "<branch>: plan" --body "..."`. If a PR already exists for the branch, update it instead.
 5. **Send a response back to the caller** — post via `mcp__claude-slack-bridge__ask_on_slack` with the PR URL and a short summary so the workflow engine can route to the next step.
-
-Pick `repo_plan_dir`:
-
-- If `has_existing_plan_process == true` and `existing_plan_path` is not null, read the file. Search for an obvious save target — a literal path the inner flow writes to (e.g. `.plan/`, `docs/plan/`, `plans/`). If found, set `repo_plan_dir` to that folder. Otherwise default to `.plan/` and the wrapper will add the save step on top of the inner flow.
-- If `has_existing_plan_process == false`, default `repo_plan_dir = ".plan/"`.
 
 Inspect the existing flow (only when `has_existing_plan_process == true`) to decide which extra steps the wrapper has to add:
 
-- Does the inner flow already write its output to a folder in the repo? If not, the wrapper must do step 2 above.
-- Does the inner flow already `git commit` + `git push`? If not, the wrapper must do step 3.
+- Does the inner flow already `git commit` + `git push` the produced doc? If not, the wrapper must do step 3. (The save in step 2 always runs — the wrapper enforces the fixed path even if the inner flow already saved elsewhere.)
 - Does the inner flow already `gh pr create` / open a PR? If not, the wrapper must do step 4.
 - Does the inner flow already respond via `ask_on_slack`? If not, the wrapper must do step 5.
 
-Whatever the inner flow already does, the wrapper should NOT duplicate — it just fills the gaps. Whatever it doesn't do, the wrapper must add. If `has_existing_plan_process == false`, treat all four boolean facts as `false` — the wrapper does steps 2–5 itself, and step 1 runs an inline plan prompt.
+Whatever the inner flow already does for steps 3–5, the wrapper should NOT duplicate — it just fills the gaps. If `has_existing_plan_process == false`, treat all three boolean facts as `false` — the wrapper does steps 3–5 itself, and step 1 runs an inline plan prompt.
 
 ### Write the wrapper
 
 Create `.claude/skills/claude-slack-bridge_plan/` if missing, then write `SKILL.md` (atomic write: `.SKILL.md.tmp` → `os.replace`) using the template below. Substitute the placeholders inline (do not leave them literal in the output):
 
-- `{repo_plan_dir}` → the folder chosen above (e.g. `.plan/`).
 - `{step_1_body}` → see the two variants below, picked based on `has_existing_plan_process`.
-- `{inner_does_save}`, `{inner_does_commit_push}`, `{inner_does_pr}`, `{inner_does_respond}` → boolean facts captured during inspection (all `false` when there is no existing flow). Use them to phrase the wrapper steps as "skip if already done by the inner flow" vs. "always do".
+- `{inner_does_commit_push}`, `{inner_does_pr}`, `{inner_does_respond}` → boolean facts captured during inspection (all `false` when there is no existing flow). Use them to phrase the wrapper steps as "skip if already done by the inner flow" vs. "always do".
+
+The save path `.roadmap_features/<branch>/plan/feature_plan.md` is fixed — it is hardcoded in the template below and never substituted.
 
 **Variant A — `has_existing_plan_process == true`** (substitute `{ref_plan_flow}` with the slash command captured in Step 2, e.g. `/plan`):
 
 ```
-Invoke `{ref_plan_flow}` to produce the plan doc. Capture the resulting markdown — either the file path it wrote to, or the inline content if it returned text. <!-- inner_does_save = {inner_does_save} -->
+Invoke `{ref_plan_flow}` to produce the plan doc. Capture the resulting markdown — either the file path it wrote to, or the inline content if it returned text.
 ```
 
 **Variant B — `has_existing_plan_process == false`** (substitute `{plan_kind}` with the free-text answer from Step 2):
@@ -136,12 +132,14 @@ Now write the wrapper file using this template:
 ```markdown
 ---
 name: claude-slack-bridge_plan
-description: "Produce a plan doc for the current feature, save it into the repo under {repo_plan_dir}, commit + push it, open a GitHub PR for review, and post the PR URL back to the caller via mcp__claude-slack-bridge__ask_on_slack. Either wraps an existing plan flow (filling in whatever steps it doesn't already perform) or runs an inline plan prompt baked into this skill."
+description: "Produce a plan doc for the current feature, save it into the repo at the fixed path .roadmap_features/<branch>/plan/feature_plan.md, commit + push it, open a GitHub PR for review, and post the PR URL back to the caller via mcp__claude-slack-bridge__ask_on_slack. Either wraps an existing plan flow (filling in whatever steps it doesn't already perform) or runs an inline plan prompt baked into this skill."
 ---
 
 # claude-slack-bridge_plan — plan phase wrapper
 
 This skill is invoked by the `/process` workflow engine as the plan step. It is the single entry point the engine calls; everything the plan phase needs to do at runtime is encoded here.
+
+Resolve `<branch>` once at the start of the run from the current git branch (`git rev-parse --abbrev-ref HEAD`) — it must match the branch the workflow is operating on. Every step below uses this same `<branch>` value.
 
 ## 1. Produce the plan doc
 
@@ -149,28 +147,26 @@ This skill is invoked by the `/process` workflow engine as the plan step. It is 
 
 ## 2. Save the plan in the repo
 
-Target path: `{repo_plan_dir}/<feature>.md` (where `<feature>` is the slug from `.claude/process.json`). Create `{repo_plan_dir}/` if it does not exist.
+Target path (fixed, not configurable): `.roadmap_features/<branch>/plan/feature_plan.md`.
 
-If the inner flow already wrote the doc to this path, skip this step. Otherwise copy / write the captured content to the target path.
+Create the parent folders if they do not exist (`mkdir -p .roadmap_features/<branch>/plan`). Always write the captured plan content to this exact path — even if the inner flow already saved the doc somewhere else, copy/move it here so the workflow has a single canonical location.
 
 ## 3. Commit and push
 
 If the inner flow already committed and pushed the plan doc, skip this step. Otherwise:
 
 ```
-git add {repo_plan_dir}/<feature>.md
-git commit -m "plan: <feature>"
+git add .roadmap_features/<branch>/plan/feature_plan.md
+git commit -m "plan: <branch>"
 git push -u origin <branch>
 ```
-
-Use the branch from `.claude/process.json` (`feature/<slug>` by default).
 
 ## 4. Open a GitHub PR
 
 If the inner flow already opened a PR, skip and capture the PR URL it returned. Otherwise:
 
 - Run `gh pr view <branch>` to check for an existing PR.
-- If none: `gh pr create --base main --head <branch> --title "<feature>: plan" --body "<short summary derived from the plan doc's first heading or first paragraph>"`.
+- If none: `gh pr create --base main --head <branch> --title "<branch>: plan" --body "<short summary derived from the plan doc's first heading or first paragraph>"`.
 - If one exists: `gh pr edit <PR#> --body "<refreshed summary>"` and let the push from step 3 surface the new commit.
 
 Capture the resulting PR URL.
@@ -189,11 +185,11 @@ Do not return until the user has replied.
 
 After writing the file, briefly confirm to the user via `AskUserQuestion`:
 
-> I wrote `.claude/skills/claude-slack-bridge_plan/SKILL.md` (saves plan under `{repo_plan_dir}`, {wraps `{ref_plan_flow}` | runs an inline `{plan_kind}` prompt}, fills in the missing commit/push/PR/respond steps). Look right?
+> I wrote `.claude/skills/claude-slack-bridge_plan/SKILL.md` (saves plan to `.roadmap_features/<branch>/plan/feature_plan.md`, {wraps `{ref_plan_flow}` | runs an inline `{plan_kind}` prompt}, fills in the missing commit/push/PR/respond steps). Look right?
 
 Options:
 1. **Yes** — return with `status: "configured"`.
-2. **No, fix it** — ask what to change (different `repo_plan_dir`? wrong `existing_plan_reference`? inner-flow inspection got it wrong? different `plan_kind`?), update the captured values, re-write the file, ask again. Cap retries at ~3.
+2. **No, fix it** — ask what to change (wrong `existing_plan_reference`? inner-flow inspection got it wrong? different `plan_kind`?), update the captured values, re-write the file, ask again. Cap retries at ~3. The save path is fixed and is not negotiable.
 3. **Skip** — delete the half-written file and return with `status: "skipped"` + `label: "plan-workflow: skip"`.
 
 ---
@@ -209,8 +205,7 @@ For the configured case (user had an existing process, or the wrapper now contai
   "status": "configured",
   "label": "plan-workflow: configured",
   "has_existing_plan_process": true,
-  "existing_plan_reference": "/plan",
-  "repo_plan_dir": ".plan/"
+  "existing_plan_reference": "/plan"
 }
 ```
 
@@ -222,7 +217,6 @@ When `has_existing_plan_process == false`, `existing_plan_reference` is `null` a
   "label": "plan-workflow: configured",
   "has_existing_plan_process": false,
   "existing_plan_reference": null,
-  "repo_plan_dir": ".plan/",
   "plan_kind": "implementation plan"
 }
 ```

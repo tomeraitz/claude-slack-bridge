@@ -58,13 +58,13 @@ Either way, continue to Step 3. Do not re-implement any of the task-manager flow
 
 ## Step 3 — capture workflow steps (delegated, end-to-end)
 
-Delegate the entire workflow-steps phase to the `build-workflow` skill via the Agent tool with `run_in_background: true`. The subagent owns asking whether an AI workflow already exists, either collecting references to the user's existing slash commands or scaffolding starter command files for them, injecting a `/review` step between each user-defined step, ensuring a trailing `/required-fixes` step, and confirming the final list with the user. Keeping all of this in a separate context window keeps the orchestrator's context clean.
+Delegate the entire workflow-steps phase to the `build-workflow` skill via the Agent tool with `run_in_background: true`. The subagent owns asking whether an AI workflow already exists, either collecting references to the user's existing slash commands or scaffolding starter command files for them, and confirming the final list with the user. Keeping all of this in a separate context window keeps the orchestrator's context clean.
 
 ```
 Agent({
   description: "Capture workflow steps end-to-end",
   subagent_type: "general-purpose",
-  prompt: "Read plugin/skills/build-workflow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. You will create `.claude/commands/<name>.md` scaffolds (including `review.md` and `required-fixes.md`) for any steps that don't already have a backing command file. Do not write `.claude/process-template.json` — that is the caller's job. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the confirmed `steps` array.",
+  prompt: "Read plugin/skills/build-workflow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. You will create `.claude/commands/<name>.md` scaffolds for any steps that don't already have a backing command file. Do not write `.claude/process-template.json` — that is the caller's job. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the confirmed `steps` array.",
   run_in_background: true
 })
 ```

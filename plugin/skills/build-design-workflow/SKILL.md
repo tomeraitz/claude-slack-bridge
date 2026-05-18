@@ -1,6 +1,6 @@
 ---
 name: build-design-workflow
-description: "Configure the design phase of the /process workflow. Asks whether the user wants a design step at all (skip-able), then asks whether they already have a design process (e.g. an existing /design command or skill). If they do, reads it and inspects whether it already saves the produced design into the repo and already commits/pushes/opens a PR; whatever is missing gets added. If they don't, asks what kind of design doc the step should produce and bakes that prompt directly into the wrapper. The ONLY file this skill writes is `.claude/skills/claude-slack-bridge_design/SKILL.md` — a wrapper skill that runs the user's design flow (`<@ref-design-flow>`) or an inline design prompt when none exists, saves the output under `.design/` (creating the folder if missing), commits and pushes if the inner flow didn't, opens a GitHub PR, and sends a response back to the caller. Never scaffolds a separate `/design` slash command. Returns a status of `configured` (with the captured reference + repo save path) or `skipped` (with the literal label `design-workflow: skip`). Use as the design-workflow phase of /process-setup."
+description: "Configure the design phase of the /process workflow. Asks whether the user wants a design step at all (skip-able), then asks whether they already have a design process (e.g. an existing /design command or skill). If they do, reads it and inspects whether it already commits/pushes/opens a PR; whatever is missing gets added. If they don't, asks what kind of design doc the step should produce and bakes that prompt directly into the wrapper. The ONLY file this skill writes is `.claude/skills/claude-slack-bridge_design/SKILL.md` — a wrapper skill that runs the user's design flow (`<@ref-design-flow>`) or an inline design prompt when none exists, saves the output to `.roadmap_features/<feature>/design/feature_design.md` (creating the folder if missing), commits and pushes if the inner flow didn't, opens a GitHub PR, and sends a response back to the caller. Never scaffolds a separate `/design` slash command. Returns a status of `configured` (with the captured reference) or `skipped` (with the literal label `design-workflow: skip`). Use as the design-workflow phase of /process-setup."
 ---
 
 # build-design-workflow — configure the /design phase and write the claude-slack-bridge_design wrapper
@@ -16,7 +16,8 @@ Return values the caller needs (printed as a fenced JSON block at the end of the
 - `label` — `design-workflow: configured` when configured, `design-workflow: skip` when skipped.
 - `has_existing_design_process` — `true` / `false` (only present when configured).
 - `existing_design_reference` — slash command or path to the user's existing design flow (only when `has_existing_design_process == true`).
-- `repo_design_dir` — the folder inside the repo where the design artifact will be saved (defaults to `.design/`).
+
+The design artifact save path is **always** `.roadmap_features/<feature>/design/feature_design.md` (no longer configurable).
 
 Do not skip ahead to writing the helper skill until Step 3 has actually captured everything it needs.
 
@@ -88,19 +89,14 @@ Options:
 This is the only file this skill ever writes. The wrapper's job at runtime is:
 
 1. **Produce the design doc** — either invoke the user's existing design flow (`{ref_design_flow}`), or, when there is no existing flow, run an inline `{design_kind}` design prompt baked directly into this same skill.
-2. **Save the design artifact in the repo** — write the produced markdown doc under `<repo_design_dir>/<feature>.md`. Create `<repo_design_dir>/` if it doesn't exist (default `.design/`).
+2. **Save the design artifact in the repo** — write the produced markdown doc to `.roadmap_features/<feature>/design/feature_design.md`, where `<feature>` is the **current git branch name** (obtain via `git rev-parse --abbrev-ref HEAD`, or read from `.claude/process.json`). Create `.roadmap_features/<feature>/design/` if it doesn't exist. This save path is **fixed** and applies in all cases — never reuse a different path the inner flow might write to; if the inner flow wrote elsewhere, the wrapper copies/moves the content here. Note: if the branch contains slashes (e.g. `feature/foo-bar`), they become nested directories in the path.
 3. **Commit and push if the inner flow didn't already** — `git add` the artifact, `git commit -m "design: <feature>"`, `git push -u origin <branch>`. Skip this if the inner flow already committed + pushed.
 4. **Open a GitHub PR** — `gh pr create --base main --head <branch> --title "<feature>: design" --body "..."`. If a PR already exists for the branch, update it instead.
 5. **Send a response back to the caller** — post via `mcp__claude-slack-bridge__ask_on_slack` with the PR URL and a short summary so the workflow engine can route to the next step.
 
-Pick `repo_design_dir`:
-
-- If `has_existing_design_process == true` and `existing_design_path` is not null, read the file. Search for an obvious save target — a literal path the inner flow writes to (e.g. `.design/`, `docs/design/`, `design/`). If found, set `repo_design_dir` to that folder. Otherwise default to `.design/` and the wrapper will add the save step on top of the inner flow.
-- If `has_existing_design_process == false`, default `repo_design_dir = ".design/"`.
-
 Inspect the existing flow (only when `has_existing_design_process == true`) to decide which extra steps the wrapper has to add:
 
-- Does the inner flow already write its output to a folder in the repo? If not, the wrapper must do step 2 above.
+- Does the inner flow already write its output to `.roadmap_features/<feature>/design/feature_design.md`? If not, the wrapper must do step 2 above (writing/copying the produced markdown to the fixed path).
 - Does the inner flow already `git commit` + `git push`? If not, the wrapper must do step 3.
 - Does the inner flow already `gh pr create` / open a PR? If not, the wrapper must do step 4.
 - Does the inner flow already respond via `ask_on_slack`? If not, the wrapper must do step 5.
@@ -111,9 +107,10 @@ Whatever the inner flow already does, the wrapper should NOT duplicate — it ju
 
 Create `.claude/skills/claude-slack-bridge_design/` if missing, then write `SKILL.md` (atomic write: `.SKILL.md.tmp` → `os.replace`) using the template below. Substitute the placeholders inline (do not leave them literal in the output):
 
-- `{repo_design_dir}` → the folder chosen above (e.g. `.design/`).
 - `{step_1_body}` → see the two variants below, picked based on `has_existing_design_process`.
 - `{inner_does_save}`, `{inner_does_commit_push}`, `{inner_does_pr}`, `{inner_does_respond}` → boolean facts captured during inspection (all `false` when there is no existing flow). Use them to phrase the wrapper steps as "skip if already done by the inner flow" vs. "always do".
+
+The save path `.roadmap_features/<feature>/design/feature_design.md` is hardcoded into the wrapper — do not parameterize it.
 
 **Variant A — `has_existing_design_process == true`** (substitute `{ref_design_flow}` with the slash command captured in Step 2, e.g. `/design`):
 
@@ -136,7 +133,7 @@ Now write the wrapper file using this template:
 ```markdown
 ---
 name: claude-slack-bridge_design
-description: "Produce a design doc for the current feature, save it into the repo under {repo_design_dir}, commit + push it, open a GitHub PR for review, and post the PR URL back to the caller via mcp__claude-slack-bridge__ask_on_slack. Either wraps an existing design flow (filling in whatever steps it doesn't already perform) or runs an inline design prompt baked into this skill."
+description: "Produce a design doc for the current feature, save it to `.roadmap_features/<feature>/design/feature_design.md`, commit + push it, open a GitHub PR for review, and post the PR URL back to the caller via mcp__claude-slack-bridge__ask_on_slack. Either wraps an existing design flow (filling in whatever steps it doesn't already perform) or runs an inline design prompt baked into this skill."
 ---
 
 # claude-slack-bridge_design — design phase wrapper
@@ -149,21 +146,19 @@ This skill is invoked by the `/process` workflow engine as the design step. It i
 
 ## 2. Save the design in the repo
 
-Target path: `{repo_design_dir}/<feature>.md` (where `<feature>` is the slug from `.claude/process.json`). Create `{repo_design_dir}/` if it does not exist.
+Target path: `.roadmap_features/<feature>/design/feature_design.md`, where `<feature>` is the **current git branch name** (use `git rev-parse --abbrev-ref HEAD`, or read it from `.claude/process.json`). Create `.roadmap_features/<feature>/design/` if it does not exist. If the branch contains slashes (e.g. `feature/foo-bar`), they become nested directories — that is intentional.
 
-If the inner flow already wrote the doc to this path, skip this step. Otherwise copy / write the captured content to the target path.
+This path is fixed. Even if the inner flow already wrote a design doc somewhere else, copy or move its content here — the rest of the pipeline (commit, PR body, downstream steps) assumes this exact path.
 
 ## 3. Commit and push
 
-If the inner flow already committed and pushed the design doc, skip this step. Otherwise:
+If the inner flow already committed and pushed the design doc at this exact path, skip this step. Otherwise (note: `<feature>` and `<branch>` resolve to the same value — the current git branch):
 
 ```
-git add {repo_design_dir}/<feature>.md
+git add .roadmap_features/<feature>/design/feature_design.md
 git commit -m "design: <feature>"
 git push -u origin <branch>
 ```
-
-Use the branch from `.claude/process.json` (`feature/<slug>` by default).
 
 ## 4. Open a GitHub PR
 
@@ -189,11 +184,11 @@ Do not return until the user has replied.
 
 After writing the file, briefly confirm to the user via `AskUserQuestion`:
 
-> I wrote `.claude/skills/claude-slack-bridge_design/SKILL.md` (saves design under `{repo_design_dir}`, {wraps `{ref_design_flow}` | runs an inline `{design_kind}` prompt}, fills in the missing commit/push/PR/respond steps). Look right?
+> I wrote `.claude/skills/claude-slack-bridge_design/SKILL.md` (saves design to `.roadmap_features/<feature>/design/feature_design.md`, {wraps `{ref_design_flow}` | runs an inline `{design_kind}` prompt}, fills in the missing commit/push/PR/respond steps). Look right?
 
 Options:
 1. **Yes** — return with `status: "configured"`.
-2. **No, fix it** — ask what to change (different `repo_design_dir`? wrong `existing_design_reference`? inner-flow inspection got it wrong? different `design_kind`?), update the captured values, re-write the file, ask again. Cap retries at ~3.
+2. **No, fix it** — ask what to change (wrong `existing_design_reference`? inner-flow inspection got it wrong? different `design_kind`?), update the captured values, re-write the file, ask again. The save path is fixed and not adjustable. Cap retries at ~3.
 3. **Skip** — delete the half-written file and return with `status: "skipped"` + `label: "design-workflow: skip"`.
 
 ---
@@ -209,8 +204,7 @@ For the configured case (user had an existing process, or the wrapper now contai
   "status": "configured",
   "label": "design-workflow: configured",
   "has_existing_design_process": true,
-  "existing_design_reference": "/design",
-  "repo_design_dir": ".design/"
+  "existing_design_reference": "/design"
 }
 ```
 
@@ -222,10 +216,11 @@ When `has_existing_design_process == false`, `existing_design_reference` is `nul
   "label": "design-workflow: configured",
   "has_existing_design_process": false,
   "existing_design_reference": null,
-  "repo_design_dir": ".design/",
   "design_kind": "system / architecture design"
 }
 ```
+
+The design artifact is always saved to `.roadmap_features/<feature>/design/feature_design.md`; this path is not part of the return shape because it is not configurable.
 
 For the skipped case (Step 1 returned No):
 

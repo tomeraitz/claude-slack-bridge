@@ -88,7 +88,7 @@ Options:
 
 This is the only file this skill ever writes. The wrapper's job at runtime is:
 
-1. **Produce the plan doc** — either invoke the user's existing plan flow (`{ref_plan_flow}`), or, when there is no existing flow, run an inline `{plan_kind}` plan prompt baked directly into this same skill.
+1. **Produce the plan doc** — first load any prior context from earlier `/process` phases (specifically the design doc at `.roadmap_features/<branch>/design/feature_design.md`, if it exists), then either invoke the user's existing plan flow (`{ref_plan_flow}`) — passing the design as the flow's PRD / design input so it does not re-prompt the user for one — or, when there is no existing flow, run an inline `{plan_kind}` plan prompt baked directly into this same skill that derives the plan from the loaded design.
 2. **Save the plan artifact in the repo** — always write the produced markdown doc to `.roadmap_features/<branch>/plan/feature_plan.md`, where `<branch>` is the current git branch name. Create the parent folders if they don't exist. This path is fixed and is NOT derived from inspecting the existing flow — if the inner flow wrote the doc somewhere else, the wrapper copies/moves it to the fixed path.
 3. **Commit and push if the inner flow didn't already** — `git add` the artifact, `git commit -m "plan: <branch>"`, `git push -u origin <branch>`. Skip this if the inner flow already committed + pushed.
 4. **Open a GitHub PR** — `gh pr create --base main --head <branch> --title "<branch>: plan" --body "..."`. If a PR already exists for the branch, update it instead.
@@ -114,7 +114,9 @@ The save path `.roadmap_features/<branch>/plan/feature_plan.md` is fixed — it 
 **Variant A — `has_existing_plan_process == true`** (substitute `{ref_plan_flow}` with the slash command captured in Step 2, e.g. `/plan`):
 
 ```
-Invoke `{ref_plan_flow}` to produce the plan doc. Capture the resulting markdown — either the file path it wrote to, or the inline content if it returned text.
+**Load prior context first.** If `.roadmap_features/<branch>/design/feature_design.md` exists, read it. When invoking `{ref_plan_flow}`, pass the design content (or its path) explicitly so the flow uses it as its PRD / design input instead of asking the user for one. If the inner flow does not accept arguments, paste the design content into the prompt context before delegating to it. If the design file does not exist, invoke the flow as normal.
+
+Then invoke `{ref_plan_flow}` to produce the plan doc. Capture the resulting markdown — either the file path it wrote to, or the inline content if it returned text.
 ```
 
 **Variant B — `has_existing_plan_process == false`** (substitute `{plan_kind}` with the free-text answer from Step 2):
@@ -123,8 +125,9 @@ Invoke `{ref_plan_flow}` to produce the plan doc. Capture the resulting markdown
 Produce a **{plan_kind}** plan doc for the current feature inline (there is no separate `/plan` command — this wrapper is the whole flow):
 
 1. Read `.claude/process.json` to get the feature slug and description.
-2. Draft a markdown plan doc covering the aspects relevant to a {plan_kind} plan (sections, headings, and depth are up to you — refine this prompt before running `/process` for a real feature).
-3. Hold the markdown content in memory; the next steps save it, commit it, open a PR, and respond.
+2. **Load the design.** If `.roadmap_features/<branch>/design/feature_design.md` exists, read it and treat it as required input — the plan must be derived from the design, not invented from scratch. If it does not exist, proceed using only the feature slug/description and call out in the plan that no design doc was found.
+3. Draft a markdown plan doc covering the aspects relevant to a {plan_kind} plan (sections, headings, and depth are up to you — refine this prompt before running `/process` for a real feature).
+4. Hold the markdown content in memory; the next steps save it, commit it, open a PR, and respond.
 ```
 
 Now write the wrapper file using this template:
@@ -142,6 +145,8 @@ This skill is invoked by the `/process` workflow engine as the plan step. It is 
 Resolve `<branch>` once at the start of the run from the current git branch (`git rev-parse --abbrev-ref HEAD`) — it must match the branch the workflow is operating on. Every step below uses this same `<branch>` value.
 
 ## 1. Produce the plan doc
+
+Before producing anything, load any prior `/process` context. Check whether `.roadmap_features/<branch>/design/feature_design.md` exists; if it does, read it and use it as the design / PRD input for the rest of this step — this avoids re-asking the user for context the design phase already captured. The variant body below describes exactly how to feed the design into the inner flow or the inline prompt.
 
 {step_1_body}
 

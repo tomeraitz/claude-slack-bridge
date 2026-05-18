@@ -55,7 +55,15 @@ Options:
 
    Record `existing_design_reference` (slash command form, e.g. `/design`) and `existing_design_path` (the resolved file path, or `null` for plugin commands). Continue to Step 3.
 
-2. **No, I don't have one** — record `has_existing_design_process = false`. Capture what kind of design the wrapper itself should produce inline. Do **not** write a `/design` command file or any other file here — the only file this skill ever writes is `.claude/skills/claude-slack-bridge_design/SKILL.md` in Step 3.
+2. **No, I don't have one** — record `has_existing_design_process = false`. Before helping the user build one inline, confirm they actually want this flow. Ask via `AskUserQuestion`:
+
+   > You don't have an existing design process. Do you want me to bake an inline design step into the `/process` workflow (it will produce a markdown design doc, save it in the repo, and open a PR for review)?
+
+   Options:
+   - **Yes, add it** — continue below to capture `design_kind`.
+   - **No, skip the design step** — return immediately with `status: "skipped"` and `label: "design-workflow: skip"`. Do not write any files.
+
+   If the user opted to continue, capture what kind of design the wrapper itself should produce inline. Do **not** write a `/design` command file or any other file here — the only file this skill ever writes is `.claude/skills/claude-slack-bridge_design/SKILL.md` in Step 3.
 
    Ask via `AskUserQuestion` (free-text reply via "Other"):
 

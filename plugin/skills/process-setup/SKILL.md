@@ -1,6 +1,6 @@
 ---
 name: process-setup
-description: "One-time per-repo configuration for the /process workflow. Delegates verification that mcp__claude-slack-bridge is installed (via the verify-bridge skill), task-manager setup end-to-end (via the build-task-manager skill, which generates `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`), and workflow-steps capture end-to-end (via the build-workflow skill, which collects or scaffolds the user-defined slash commands, injects /review between steps, and ensures /required-fixes at the tail). Then writes `.claude/process-template.json` (version 1) and a `.claude/commands/process.md` orchestrator, and appends `.claude/worktrees/` and `.claude/processes/` to `.gitignore`. Use when the user runs /process-setup or asks to set up / re-configure the /process workflow for this repository."
+description: "One-time per-repo configuration for the /process workflow. Delegates verification that mcp__claude-slack-bridge is installed (via the verify-bridge skill), task-manager setup end-to-end (via the build-task-manager skill, which generates `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`), and workflow-steps capture end-to-end (via the build-workflow skill, which collects or scaffolds the user-defined slash commands, injects /review between steps, and ensures /required-fixes at the tail). Use when the user runs /process-setup or asks to set up / re-configure the /process workflow for this repository."
 ---
 
 # /process-setup — one-time per-repo configuration
@@ -71,81 +71,34 @@ Agent({
 
 When the subagent's completion notification arrives, parse its JSON return block and record:
 - `status` — must be `configured`.
-- `steps` — the confirmed array of `{name, command, reference}` entries, in order. This is the array that gets written verbatim into `.claude/process-template.json` in Step 4.
+- `steps` — the confirmed array of `{name, command, reference}` entries, in order.
 
 Do not re-implement any of the workflow-steps flow inline here — `build-workflow` is the single source of truth for that phase, including writing the `.claude/commands/*.md` scaffolds.
 
 ---
 
-## Step 4 — write `.claude/process-template.json`
+## Step 4 — write the `/process` orchestrator command (delegated, end-to-end)
 
-Create `.claude/process-template.json` in `cwd` with this exact shape, populating `steps` from the array returned by `build-workflow` in Step 3:
+Delegate generation of `.claude/commands/process.md` to the `build-process-skill` skill via the Agent tool with `run_in_background: true`. The subagent owns checking whether the file already exists (offering keep / overwrite / rename), writing the scaffold atomically, and confirming with the user. Keeping all of this in a separate context window keeps the orchestrator's context clean.
 
-```json
-{
-  "version": 1,
-  "branch_pattern": "feature/{slug}",
-  "steps": [ ...the steps array from Step 3, verbatim... ]
-}
+```
+Agent({
+  description: "Write /process orchestrator command",
+  subagent_type: "general-purpose",
+  prompt: "Read plugin/skills/build-process-skill/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. You will write `.claude/commands/process.md` (or the user's chosen filename) from the scaffold defined in the skill. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the status (configured or skipped) and the path written.",
+  run_in_background: true
+})
 ```
 
-For reference, a typical confirmed list from Step 3 looks like:
+When the subagent's completion notification arrives, parse its JSON return block and record:
+- `status` ∈ `{configured, skipped}`
+- on `configured`: `path` (for the final summary in Step 5).
 
-```json
-[
-  { "name": "design",         "command": "/design",         "reference": ".claude/commands/design.md" },
-  { "name": "review",         "command": "/review",         "reference": ".claude/commands/review.md" },
-  { "name": "plan",           "command": "/plan",           "reference": ".claude/commands/plan.md" },
-  { "name": "review",         "command": "/review",         "reference": ".claude/commands/review.md" },
-  { "name": "execute",        "command": "/execute",        "reference": ".claude/commands/execute.md" },
-  { "name": "review",         "command": "/review",         "reference": ".claude/commands/review.md" },
-  { "name": "required-fixes", "command": "/required-fixes", "reference": ".claude/commands/required-fixes.md" }
-]
-```
-
-Always set `version: 1` and `branch_pattern: "feature/{slug}"`. Each step entry must carry `name`, `command`, and `reference` (path to the slash-command file or `null` if the command is plugin-provided). Use atomic write (`.claude/process-template.json.tmp` → `os.replace`).
+Either way, continue to Step 5. Do not re-implement any of the process-command flow inline here — `build-process-skill` is the single source of truth for that phase, including writing `.claude/commands/process.md`.
 
 ---
 
-## Step 5 — create the `/process` orchestrator command
-
-Create `.claude/commands/process.md` if it does not already exist. This is the local entry point that knows how to activate each step in the configured workflow — it reads `.claude/process-template.json` and walks through the steps in order, dispatching to each step's `command` and routing to `/required-fixes` when a `/review` step surfaces reviewer comments.
-
-If `.claude/commands/process.md` already exists, leave it alone (the user — or the plugin — has already provided one). Otherwise write this scaffold:
-
-```markdown
----
-name: process
-description: "Orchestrate the configured workflow: read .claude/process-template.json and run each step in order, with /review between steps and /required-fixes when reviewers leave comments."
----
-
-# /process
-
-Activate each step of the configured workflow.
-
-1. Read `.claude/process-template.json`. Verify `version == 1`; otherwise abort and tell the user to re-run `/process-setup`.
-2. For each step in `steps[]`, in order:
-   - Look up the step's slash command and its `reference` file.
-   - Invoke the slash command (e.g. `/design`, `/review`, `/execute`).
-   - When a `/review` step reports that reviewers left comments, jump to the `/required-fixes` step before continuing the next user-defined step. After `/required-fixes` reports the PR is approved, resume the next step.
-3. Stop after the last user-defined step's `/review` is approved. The trailing `/required-fixes` step is only run on demand (when a review surfaces comments) — it is not run unconditionally at the end.
-
-When run through the claude-slack-bridge daemon, this orchestration is performed by the bridge's workflow engine instead — `/process` then only runs the clarification phase (`plugin/skills/process/SKILL.md`) and hands the step list off to the daemon. Use this local scaffold when running the workflow directly in Claude Code without the Slack bridge.
-```
-
-Use atomic write (`.claude/commands/process.md.tmp` → `os.replace`). Create `.claude/commands/` first if missing.
-
----
-
-## Step 6 — append to `.gitignore`
-
-Read `cwd/.gitignore` if it exists. If `.claude/worktrees/` is not present as its own line, append it (with a leading newline if the file doesn't end in one). Same for `.claude/processes/`. If `.gitignore` doesn't exist, create it with these two lines.
-
-Do not rewrite or reorder existing entries.
-
----
-
-## Step 7 — confirm
+## Step 5 — confirm
 
 Print a one-line summary to stdout and exit zero:
 
@@ -159,5 +112,5 @@ Where `X` is the slug (or `none`) and `Y` is the integration method (or `none`).
 
 ## Failure handling
 
-- Any unrecoverable error (e.g. unreadable plugin template, can't write `.claude/`, malformed user reply that doesn't recover after one retry) → print a short error describing what went wrong and exit non-zero. Do not leave a half-written `.claude/process-template.json` (use atomic write).
+- Any unrecoverable error (e.g. unreadable plugin template, malformed user reply that doesn't recover after one retry) → print a short error describing what went wrong and exit non-zero.
 - Do not catch and ignore exceptions silently.

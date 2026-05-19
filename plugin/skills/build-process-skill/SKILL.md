@@ -106,6 +106,76 @@ json
 
    After posting, end your turn. The current session does not wait for or supervise the worktree session — state lives in `process.json`, and Slack drives the next move.
 
+## Step 2 — run a step from `process.json`
+
+This step runs when the user's argument means "run the step that's currently configured in `process.json`". Two variants share this branch:
+
+- **`/process start first step`** — run the step currently recorded in `process.json` as-is. Used right after `/process start` hands off into the new worktree, when the step was just initialized by Step 1.
+- **`/process next step`** — first advance `process.json` to the next step in the flow, then run it.
+
+A third related argument is handled here for symmetry:
+
+- **`/process not approved`** — the previous step's PR was rejected. Do **not** advance `process.json`; re-run the current step so the skill can address the feedback.
+
+### Step flow
+
+The configured workflow is:
+
+1. **`design`** — *optional*. Only present if the `claude-slack-bridge_design` skill exists in this repo (check `.claude/skills/claude-slack-bridge_design/SKILL.md`). Otherwise the flow starts at `plan`.
+2. **`plan`** — *mandatory*.
+3. **`run-plan`** — *mandatory*.
+
+Each step name maps to a skill:
+
+| `process.json` step | Skill to invoke                |
+| ------------------- | ------------------------------ |
+| `design`            | `claude-slack-bridge_design`   |
+| `plan`              | `claude-slack-bridge_plan`     |
+| `run-plan`          | `claude-slack-bridge_run-plan` |
+
+### Behavior
+
+1. **Identify the feature and read state.** Determine `<feature>` from the current worktree (worktree folder name or current git branch). Read `.roadmap_features/<feature>/process.json` to get the current `step`.
+
+2. **Adjust `process.json` based on the argument.**
+   - If the argument was **`next step`**: pick the next step in the flow above (`design` → `plan`, `plan` → `run-plan`). If the current step is already `run-plan`, there is no next step — post via Slack that the workflow is complete and stop. Otherwise write the new step back to `process.json` (set `status: "started"`).
+   - If the argument was **`start first step`**: do not change `process.json` — Step 1 already initialized it.
+   - If the argument was **`not approved`**: do not change `process.json`. Optionally post a brief Slack note acknowledging the rejection before continuing to step 3.
+
+3. **If the argument was `not approved`, gather PR feedback and the skill's re-run shape — all in separate contexts.** Skip this sub-step on `start first step` / `next step`.
+
+   3a. **Fetch the PR and all its comments (separate Agent context).** Identify the PR URL for the current step's work — prefer the URL posted by the previous `/process` step in Slack; otherwise derive it via `gh pr list --head <feature> --json url,number`. Then spawn an Agent (`subagent_type: general-purpose`) whose only job is to collect every reviewer-visible comment on the PR and return them as a structured feedback bundle. Suggested prompt:
+
+   > "For PR `<pr-url>`, collect every reviewer comment: top-level review summaries (`gh pr view <pr-url> --json reviews,comments`), inline review comments (`gh api repos/<owner>/<repo>/pulls/<n>/comments`), and issue-style comments (`gh api repos/<owner>/<repo>/issues/<n>/comments`). Return them grouped by file/line where applicable, with author and body, as a single bundle. Do not edit anything."
+
+   3b. **Read the step's skill and decide the re-run shape (separate Agent context).** Spawn another Agent (`subagent_type: general-purpose`) to read `.claude/skills/<skill-name>/SKILL.md` for the current step and report back how it expects to be re-run against reviewer feedback. Specifically: does the skill itself spawn an inner subagent / inner process for addressing feedback, or is it meant to be driven directly with the feedback in the prompt? Suggested prompt:
+
+   > "Read `.claude/skills/<skill-name>/SKILL.md` end-to-end and report: (1) how this skill is normally invoked for a re-run after reviewer feedback, (2) whether it expects to spawn its own subagent or inner process for the fix-up pass, or whether the caller should drive it directly, and (3) what inputs it needs (feedback format, paths, etc.). Do not invoke the skill — just describe it."
+
+   Keep the outputs of 3a and 3b small and structured — they are inputs to sub-step 4, not material that should sit in the orchestrator's context beyond that handoff.
+
+4. **Invoke the step's skill in a separate Agent context.** Use the Agent tool with `subagent_type: general-purpose` so the skill's chatter does not pollute this command's context. Pass the worktree path, feature name, and `process.json` path so the skill knows where it is operating.
+
+   Suggested Agent call:
+   - `description`: `"Run <step> step for <feature>"`
+   - `subagent_type`: `general-purpose`
+   - `prompt`: `"Invoke the <skill-name> skill end-to-end for feature <feature> in worktree <worktree-path>. When complete, return the GitHub PR URL it opened along with any details the user needs to approve or reject the work."`
+
+   Map `<step>` → `<skill-name>` using the table above.
+
+   **When the argument was `not approved`:** extend the prompt with the PR feedback bundle from 3a and follow the re-run shape surfaced by 3b — i.e. if 3b says the skill spawns its own inner subagent for fix-ups, invoke it that way; if it expects to be driven directly with the feedback, pass the bundle inline. Make clear in the prompt that this is a fix-up pass on the existing PR, not a fresh run.
+
+5. **Relay any mid-skill questions to Slack in the same thread.** If the spawned skill needs user input, surface its question via `mcp__claude-slack-bridge__ask_on_slack` posted to **the same Slack thread** that triggered this `/process` run (so the conversation stays linear). Forward the user's answer back to the spawned skill and continue.
+
+6. **When the skill finishes, post the PR link to Slack and hand back control.** Post via `mcp__claude-slack-bridge__ask_on_slack`:
+
+   > Step `<step>` finished. PR: `<pr-url>`
+   >
+   > • If you **approve**, reply in a **new thread**: `@claude-bot [<worktree-path>] /process next step`
+   > • If you do **not** approve, reply in a **new thread**: `@claude-bot [<worktree-path>] /process not approved`
+
+   Substitute `<step>`, `<pr-url>`, and `<worktree-path>` with the real values. After posting, end your turn — the current session does not wait. The next move is driven by the user's reply in a new Slack thread, which the daemon routes back into this same worktree to run `/process next step` or `/process not approved`.
+
 <!-- rest of body to be filled in -->
 ```
 

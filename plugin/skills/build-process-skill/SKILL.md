@@ -90,14 +90,21 @@ This step runs when the user's argument means "start the process" — e.g. `/pro
 
 5. **Create the feature folder and state file.** Inside the new worktree, create `.roadmap_features/<feature>/` and write `.roadmap_features/<feature>/process.json` with:
 
-   ```json
+json
    {
      "step": "<design or plan>",
      "status": "started"
    }
-   ```
 
    Set `step` to `"design"` if the skill `claude-slack-bridge_design` exists in this repo (check `.claude/skills/claude-slack-bridge_design/SKILL.md`); otherwise set it to `"plan"`.
+
+6. **Hand off to the new worktree session via Slack.** Post via `mcp__claude-slack-bridge__ask_on_slack`:
+
+   > `@claude-bot [<worktree-path>] /process start first step`
+
+   Substitute `<worktree-path>` with whatever tag/path the Slack daemon uses to route to this worktree (typically the worktree's absolute path or the feature slug, matching the bridge's existing project-tag convention). The daemon picks up this message, spawns a fresh Claude session inside the worktree, and that session runs `/process start first step` — which reads `.roadmap_features/<feature>/process.json` and dispatches to the first configured step (design or plan).
+
+   After posting, end your turn. The current session does not wait for or supervise the worktree session — state lives in `process.json`, and Slack drives the next move.
 
 <!-- rest of body to be filled in -->
 ```

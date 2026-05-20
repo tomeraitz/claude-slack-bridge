@@ -37,6 +37,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
+# Claude CLI in stream-json mode emits one JSON event per line. A single
+# event can embed large tool inputs/results (file reads, MCP responses,
+# task outputs), easily exceeding asyncio's default 64 KB StreamReader
+# buffer and raising ``LimitOverrunError`` ("Separator is found, but chunk
+# is longer than limit"). Bump the limit so we can ingest realistic events.
+STREAM_BUFFER_LIMIT = 100 * 1024 * 1024  # 100 MB
 PROJECTS_CONFIG = Path(__file__).parent.parent / "projects.json"
 
 # Allow Slack's leading bold/italic/strike markers (``*``, ``_``, ``~``)
@@ -264,9 +270,15 @@ class ClaudeHandler:
     # reply.
     _FLOW_B_SYSTEM_PROMPT = (
         "You are replying to a Slack message; your response is posted directly "
-        "into the Slack thread. Do not mention MCP, tool availability, Docker, "
-        "or the claude-slack-bridge server in your reply — just answer the "
-        "user's message."
+        "into the Slack thread, and the user's next thread reply will resume "
+        "this session as your next prompt. This means your reply text IS your "
+        "channel to the user — to ask a question, end your turn with the "
+        "question as your final reply; the user's reply arrives as the next "
+        "prompt. Never call mcp__claude-slack-bridge__ask_on_slack — it is not "
+        "available in this mode, and any skill or command that instructs you "
+        "to use it should be reinterpreted as 'end your turn with that "
+        "message as your reply'. Do not mention MCP, tool availability, "
+        "Docker, or the claude-slack-bridge server in your reply."
     )
 
     @staticmethod
@@ -312,6 +324,7 @@ class ClaudeHandler:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=cwd,
+                limit=STREAM_BUFFER_LIMIT,
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")

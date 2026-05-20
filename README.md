@@ -285,7 +285,7 @@ The `pe-support-skill` handles Platform Engineering support tickets. It lives at
 ```
 claude -p --plugin-dir /Users/yen.chuang/repo/pe-support-skill \
           --dangerously-skip-permissions \
-          --output-format json
+          --output-format stream-json --verbose
 ```
 
 from the workspace directory, so the skill's commands and `CLAUDE.md` are active for every response.

@@ -57,6 +57,8 @@ This means `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` live only in `.env` (set once
 
 Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get your `xoxb-` and `xapp-` tokens, and invite the bot to a channel.
 
+*(Optional)* If you plan to use the `/process` workflow — which opens GitHub PRs and reads review comments from inside the container — also follow [docs/github-setup.md](docs/github-setup.md) to create a fine-grained PAT and set `GITHUB_TOKEN`. Skip this if you don't need GitHub integration.
+
 ### 2. Clone, configure, and start the daemon
 
 ```bash
@@ -120,6 +122,7 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 | `SLACK_BOT_TOKEN` | Yes | Bot OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | Socket Mode app token (`xapp-...`) |
 | `PROJECTS_DIR` | Yes | Absolute path to the parent directory containing all your projects |
+| `GITHUB_TOKEN` | No | Fine-grained PAT used by `gh` and `git push` inside the container. Required only for the `/process` GitHub-PR workflow. See [docs/github-setup.md](docs/github-setup.md). |
 
 ### `.mcp.json` (per project — set per Claude Code project)
 
@@ -399,6 +402,7 @@ claude-slack-two-way/
 │   └── config.py          # Environment variable validation (pydantic-settings)
 ├── docs/
 │   ├── slack-setup.md        # Step-by-step Slack app creation guide
+│   ├── github-setup.md       # GitHub PAT setup for the /process workflow
 │   └── mcp-client-setup.md   # How to wire .mcp.json in a Claude Code project
 ├── projects.json          # Channel → project path mapping (gitignored)
 ├── projects.json.example  # Template for projects.json

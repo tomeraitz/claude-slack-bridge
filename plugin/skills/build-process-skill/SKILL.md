@@ -78,15 +78,17 @@ This step runs when the user's argument means "start the process" — e.g. `/pro
 
    Record the user's chosen task as `<feature>` — its name becomes both the branch name and the feature slug for the rest of the workflow. Normalize the name into a git-safe slug (lowercase, spaces → `-`, drop characters git refuses) before using it as a branch name.
 
-3. **Create the worktree.** Create a new git worktree with the branch name set to `<feature>`. Run via Bash:
+3. **Create the worktree, then rewrite its gitdir pointers to relative paths.** Run via Bash from the main repo root — substitute `<feature>` and `<repo>` (the main repo's directory name, e.g. `claude-slack-two-way`):
 
    ```
-   git worktree add --relative-paths ../<feature> -b <feature>
+   git worktree add ../<feature> -b <feature>
+   echo "gitdir: ../<repo>/.git/worktrees/<feature>" > ../<feature>/.git
+   echo "../../../../<feature>/.git" > .git/worktrees/<feature>/gitdir
    ```
 
-   The `--relative-paths` flag is important: it makes git store relative paths in the worktree's pointer files (`<worktree>/.git` and `.git/worktrees/<feature>/gitdir`) instead of absolute ones. This keeps the worktree usable when the same files are read from different absolute paths — e.g. when `/process` runs inside the Slack daemon's Docker container (which sees the repo at `/projects/<repo>`) but the user opens the worktree from the host (e.g. `C:/.../<repo>`). With absolute paths, the host's git can't find the metadata the container wrote, and the worktree shows up as `prunable`. Requires git ≥ 2.48.
+   Why the rewrite: when `/process` runs inside the Slack daemon's Docker container, git defaults to storing absolute paths like `/projects/...` in the two pointer files (`<worktree>/.git` and `<repo>/.git/worktrees/<feature>/gitdir`). The user's host OS sees the same repo at a different absolute path, so host-side `git worktree list` can't resolve the metadata and reports the worktree as `prunable`. Rewriting both pointers to relative paths makes the container view and the host view resolve identically. (This is the manual equivalent of git 2.48's `--relative-paths` flag, done by hand because the container ships git 2.47.)
 
-   (Adjust the worktree path if the project's setup uses `.claude/worktrees/<feature>` or similar — pick the location that matches the repo's existing convention.)
+   (Adjust the worktree path if the project's setup uses `.claude/worktrees/<feature>` or similar. The relative paths above assume the worktree and main repo are siblings under the same parent directory, which is the layout `../<feature>` produces.)
 
 4. **Copy gitignored files into the new worktree.** Read `.gitignore` from the repo root. For each entry that exists in the current working tree (files or directories — e.g. `.mcp.json`, `.env`, `.claude/`, `projects.json`), copy it into the new worktree folder so the worktree has the same local-only files as the source checkout. Run via Bash (use `cp -r` for directories, `cp` for files). Skip entries that don't exist locally. Do not copy build/cache patterns like `__pycache__/`, `*.pyc`, `.pytest_cache/` — those are regeneratable and would just bloat the worktree.
 

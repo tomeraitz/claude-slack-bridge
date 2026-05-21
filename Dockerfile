@@ -1,22 +1,15 @@
 FROM python:3.12-slim
 
-# Install Node.js 20 LTS (required for Claude Code CLI)
+# git, gh (GitHub CLI), and Node.js 20 — all from Debian trixie's default repos
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates gnupg \
-    && echo "deb http://deb.debian.org/debian bookworm-backports main" \
-         > /etc/apt/sources.list.d/backports.list \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-         | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-         > /etc/apt/sources.list.d/github-cli.list \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends -t bookworm-backports git \
-    && apt-get install -y --no-install-recommends nodejs gh \
+        ca-certificates curl git gh nodejs npm \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
+
+# Trust bind-mounted repos regardless of host ownership (git ≥ 2.35.4 safe.directory check)
+RUN git config --system --add safe.directory '*'
 
 RUN useradd -m appuser && mkdir -p /home/appuser/.claude && chown appuser:appuser /home/appuser/.claude
 

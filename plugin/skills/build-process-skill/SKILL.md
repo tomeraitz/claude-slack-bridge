@@ -81,10 +81,8 @@ This step runs when the user's argument means "start the process" — e.g. `/pro
 3. **Create the worktree.** Create a new git worktree with the branch name set to `<feature>`. Run via Bash:
 
    ```
-   git worktree add --relative-paths ../<feature> -b <feature>
+   git worktree add ../<feature> -b <feature>
    ```
-
-   The `--relative-paths` flag is important: it makes git store relative paths in the worktree's pointer files (`<worktree>/.git` and `.git/worktrees/<feature>/gitdir`) instead of absolute ones. This keeps the worktree usable when the same files are read from different absolute paths — e.g. when `/process` runs inside the Slack daemon's Docker container (which sees the repo at `/projects/<repo>`) but the user opens the worktree from the host (e.g. `C:/.../<repo>`). With absolute paths, the host's git can't find the metadata the container wrote, and the worktree shows up as `prunable`. Requires git ≥ 2.48.
 
    (Adjust the worktree path if the project's setup uses `.claude/worktrees/<feature>` or similar — pick the location that matches the repo's existing convention.)
 

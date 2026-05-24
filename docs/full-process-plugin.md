@@ -31,7 +31,7 @@ In Claude Code, add this repo as a plugin marketplace and install the `full-proc
 /plugin install full-process@claude-slack-bridge
 ```
 
-Once installed, both `/process-setup` and `/process` are available as slash commands.
+Once installed, the `/process-setup` is available as slash commands.
 
 > See [Claude Code's plugin docs](https://docs.claude.com/en/docs/claude-code/plugins) for more on managing plugins and marketplaces.
 

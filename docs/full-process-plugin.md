@@ -24,9 +24,16 @@ The plugin and the daemon's workflow engine are **version-locked**. `process-set
 
 ## Step 1 — install the plugin
 
-Add the plugin from this repo to your Claude Code installation. Once installed, both `/process-setup` and `/process` are available as slash commands.
+In Claude Code, add this repo as a plugin marketplace and install the `full-process` plugin:
 
-> See [Claude Code's plugin docs](https://docs.claude.com/en/docs/claude-code/plugins) for the exact install command for your setup.
+```
+/plugin marketplace add tomeraitz/claude-slack-bridge
+/plugin install full-process@claude-slack-bridge
+```
+
+Once installed, both `/process-setup` and `/process` are available as slash commands.
+
+> See [Claude Code's plugin docs](https://docs.claude.com/en/docs/claude-code/plugins) for more on managing plugins and marketplaces.
 
 ---
 

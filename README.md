@@ -123,6 +123,7 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 | `SLACK_APP_TOKEN` | Yes | Socket Mode app token (`xapp-...`) |
 | `PROJECTS_DIR` | Yes | Absolute path to the parent directory containing all your projects |
 | `GITHUB_TOKEN` | No | Fine-grained PAT used by `gh` and `git push` inside the container. Required only for the `/process` GitHub-PR workflow. See [docs/github-setup.md](docs/github-setup.md). |
+| `LOG_LEVEL` | No | Daemon log verbosity. `INFO` (default) logs lifecycle events only — sessions, channel mapping, errors. `DEBUG` additionally streams every Claude event (assistant text, thinking, `tool_use`, `tool_result`) as it arrives — useful for debugging Slack → Claude runs. |
 
 ### `.mcp.json` (per project — set per Claude Code project)
 

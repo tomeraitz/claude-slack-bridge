@@ -314,7 +314,7 @@ class ClaudeHandler:
         for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(_key, None)
 
-        logger.info("claude spawn: cwd=%s cmd=%s prompt=%r", cwd, cmd, prompt[:500])
+        logger.debug("claude spawn: cwd=%s cmd=%s prompt=%r", cwd, cmd, prompt[:500])
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -348,7 +348,7 @@ class ClaudeHandler:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    logger.info("claude stdout (non-json): %s", line[:1000])
+                    logger.debug("claude stdout (non-json): %s", line[:1000])
                     continue
                 self._log_stream_event(event)
                 if (
@@ -398,12 +398,17 @@ class ClaudeHandler:
 
     @staticmethod
     def _log_stream_event(event: Any) -> None:
-        """Log a single stream-json event from ``claude -p`` in human-readable form."""
+        """Log a single stream-json event from ``claude -p`` in human-readable form.
+
+        All per-event logs are at DEBUG so the default INFO level matches the
+        pre-stream-json behaviour (lifecycle only). Set ``LOG_LEVEL=DEBUG`` to
+        see the full trace of Claude's tool calls and reasoning.
+        """
         if not isinstance(event, dict):
             return
         etype = event.get("type")
         if etype == "system":
-            logger.info(
+            logger.debug(
                 "claude stream: system/%s session=%s cwd=%s tools=%s",
                 event.get("subtype", ""),
                 event.get("session_id", ""),
@@ -418,13 +423,13 @@ class ClaudeHandler:
                 if btype == "text":
                     text = (block.get("text") or "").strip()
                     if text:
-                        logger.info("claude text: %s", text[:2000])
+                        logger.debug("claude text: %s", text[:2000])
                 elif btype == "thinking":
                     thought = (block.get("thinking") or "").strip()
                     if thought:
-                        logger.info("claude thinking: %s", thought[:2000])
+                        logger.debug("claude thinking: %s", thought[:2000])
                 elif btype == "tool_use":
-                    logger.info(
+                    logger.debug(
                         "claude tool_use: %s id=%s input=%s",
                         block.get("name", ""),
                         block.get("id", ""),
@@ -439,14 +444,14 @@ class ClaudeHandler:
                     content = "".join(
                         c.get("text", "") for c in content if isinstance(c, dict)
                     )
-                logger.info(
+                logger.debug(
                     "claude tool_result%s id=%s: %s",
                     " (error)" if block.get("is_error") else "",
                     block.get("tool_use_id", ""),
                     str(content)[:2000],
                 )
         elif etype == "result":
-            logger.info(
+            logger.debug(
                 "claude stream: result subtype=%s duration_ms=%s num_turns=%s usage=%s",
                 event.get("subtype", ""),
                 event.get("duration_ms", ""),
@@ -454,7 +459,7 @@ class ClaudeHandler:
                 event.get("usage", ""),
             )
         else:
-            logger.info("claude stream: %s %s", etype, json.dumps(event, ensure_ascii=False)[:500])
+            logger.debug("claude stream: %s %s", etype, json.dumps(event, ensure_ascii=False)[:500])
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""

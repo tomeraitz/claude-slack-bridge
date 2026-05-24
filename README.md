@@ -143,7 +143,7 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 | Route channels to projects | [docs/slack-to-claude-projects.md#projectsjson--channel--project-routing](docs/slack-to-claude-projects.md#projectsjson--channel--project-routing) |
 | Use git worktrees from Slack | [docs/slack-to-claude-projects.md#worktrees](docs/slack-to-claude-projects.md#worktrees) |
 | Run the turnkey feature-dev workflow from Slack | [docs/full-process-plugin.md](docs/full-process-plugin.md) |
-| Configure access control or see all env vars | [docs/configuration.md](docs/configuration.md) |
+| Lock down the bot with an allowlist of users and channels (`SECURITY_*` env vars) so only approved people in approved channels can invoke Claude — and see all other env vars | [docs/configuration.md](docs/configuration.md) |
 | Understand the daemon + session internals | [docs/architecture.md](docs/architecture.md) |
 | Use the `/process` GitHub PR workflow | [docs/github-setup.md](docs/github-setup.md) |
 | Wire `.mcp.json` in a Claude Code project | [docs/mcp-client-setup.md](docs/mcp-client-setup.md) |

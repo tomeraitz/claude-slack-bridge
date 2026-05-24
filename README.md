@@ -147,6 +147,7 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 | Understand the daemon + session internals | [docs/architecture.md](docs/architecture.md) |
 | Use the `/process` GitHub PR workflow | [docs/github-setup.md](docs/github-setup.md) |
 | Wire `.mcp.json` in a Claude Code project | [docs/mcp-client-setup.md](docs/mcp-client-setup.md) |
+| Use Cursor IDE as an MCP client | [docs/cursor-setup.md](docs/cursor-setup.md) |
 
 ---
 
@@ -154,7 +155,7 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 
 - Docker (with Docker Compose)
 - A Slack workspace where you can create apps
-- Claude Code (or any MCP-compatible client)
+- Claude Code or Cursor IDE (or any MCP-compatible client)
 
 ---
 

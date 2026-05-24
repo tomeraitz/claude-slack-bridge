@@ -36,12 +36,27 @@ class SlackDaemon:
     Unix domain socket, and handles Human→Claude messages via the Claude
     Code CLI.
 
+    Supports a dual-bot mode where a second Slack App (cursor-bot) listens
+    concurrently alongside the primary claude-bot. Both apps share the same
+    ``_pending`` dict (keyed by ``thread_ts``) and Unix socket server so
+    replies are routed correctly regardless of which bot posted the message.
+
     Args:
-        bot_token: Slack bot OAuth token (xoxb-...).
-        app_token: Slack app-level token for Socket Mode (xapp-...).
+        bot_token: Slack bot OAuth token for claude-bot (xoxb-...).
+        app_token: Slack app-level token for claude-bot Socket Mode (xapp-...).
+        cursor_bot_token: (Optional) Slack bot OAuth token for cursor-bot (xoxb-...).
+                          When non-empty, a second Socket Mode connection is started.
+        cursor_app_token: (Optional) Slack app-level token for cursor-bot Socket Mode (xapp-...).
+                          Required when ``cursor_bot_token`` is provided.
     """
 
-    def __init__(self, bot_token: str, app_token: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        app_token: str,
+        cursor_bot_token: str = "",
+        cursor_app_token: str = "",
+    ) -> None:
         self._app = AsyncApp(token=bot_token)
         self._handler = AsyncSocketModeHandler(self._app, app_token)
         self._pending: dict[str, asyncio.StreamWriter] = {}
@@ -53,6 +68,17 @@ class SlackDaemon:
         self._access_control = AccessControl(SecurityConfig.from_env())
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
+
+        # Cursor dual-bot: optional second Socket Mode connection
+        if cursor_bot_token and cursor_app_token:
+            self._cursor_app = AsyncApp(token=cursor_bot_token)
+            self._cursor_handler: AsyncSocketModeHandler | None = AsyncSocketModeHandler(
+                self._cursor_app, cursor_app_token
+            )
+            self._cursor_app.event("message")(self._handle_slack_message)
+            self._cursor_app.event("app_mention")(self._handle_app_mention)
+        else:
+            self._cursor_handler = None
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -216,7 +242,7 @@ class SlackDaemon:
         logger.info("Unix socket server listening at %s.", SOCKET_PATH)
 
         async with server:
-            await asyncio.gather(
-                server.serve_forever(),
-                self._handler.start_async(),
-            )
+            handlers = [server.serve_forever(), self._handler.start_async()]
+            if self._cursor_handler is not None:
+                handlers.append(self._cursor_handler.start_async())
+            await asyncio.gather(*handlers)

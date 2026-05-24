@@ -1,9 +1,18 @@
 """
 session.py — Session entry point (docker exec target).
 
-Each Claude Code session starts one instance of this process via:
+Each Claude Code or Cursor IDE session starts one instance of this process via:
 
     docker exec -i -e SLACK_CHANNEL=#my-channel claude-slack-bridge python session.py
+
+For Cursor IDE sessions, pass ``CLIENT_ID=cursor`` as an additional env var so
+the session uses the cursor-bot Slack credentials instead of the default claude-bot:
+
+    docker exec -i -e SLACK_CHANNEL=#my-channel -e CLIENT_ID=cursor claude-slack-bridge python session.py
+
+The ``CLIENT_ID`` env var selects which Slack bot identity is used to post
+messages. ``CLIENT_ID=claude`` (the default) uses ``SLACK_BOT_TOKEN``;
+``CLIENT_ID=cursor`` uses ``CURSOR_SLACK_BOT_TOKEN``.
 
 The process runs an MCP stdio server with the ``ask_on_slack`` tool.
 It posts messages to the channel in SLACK_CHANNEL and waits for replies
@@ -34,8 +43,20 @@ async def run(config: Config) -> None:
     Args:
         config: Validated configuration (reads SLACK_CHANNEL from env,
                 overridden per-project via ``docker exec -e``).
+                When ``config.client_id == "cursor"``, the session uses
+                ``CURSOR_SLACK_BOT_TOKEN`` to post messages so they appear
+                under the cursor-bot identity in Slack.
     """
-    app = AsyncApp(token=config.slack_bot_token)
+    if config.client_id == "cursor":
+        bot_token = config.cursor_slack_bot_token
+        if not bot_token:
+            raise RuntimeError(
+                "CLIENT_ID=cursor requires CURSOR_SLACK_BOT_TOKEN to be set."
+            )
+    else:
+        bot_token = config.slack_bot_token
+
+    app = AsyncApp(token=bot_token)
 
     async def post_message(
         text: str,

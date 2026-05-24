@@ -80,7 +80,7 @@ claude-slack-two-way/
 │   └── skills/
 ├── docs/
 │   ├── architecture.md             # (this file)
-│   ├── configuration.md            # Full env var + access control reference
+│   ├── security.md                 # Access control + full env var reference
 │   ├── slack-to-claude-projects.md # Tag-the-bot flow, projects.json, worktrees
 │   ├── full-process-plugin.md      # /process-setup and /process workflow
 │   ├── slack-setup.md              # Slack app creation

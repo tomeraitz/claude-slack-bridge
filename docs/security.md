@@ -1,6 +1,23 @@
-# Configuration
+# Security & configuration
 
 Full reference for `.env`, `.mcp.json`, and access control. The README's Quickstart covers the minimum to get running — this doc is the complete picture.
+
+---
+
+## What "secure" means here
+
+By default the bridge will respond to **anyone in any channel where the Slack app is installed**. That is fine for a personal workspace but unsafe for a shared one — anybody who can DM the bot or invite it to a channel can drive Claude on your machine, read files in `PROJECTS_DIR`, and trigger `git`, `gh`, and other tools the daemon has access to.
+
+The `SECURITY_*` env vars below let you turn the bridge into a **two-dimensional allowlist**:
+
+- **Who** — only Slack user IDs in `SECURITY_ALLOWED_USERS` can invoke the bot. Everyone else gets `SECURITY_REJECTION_MESSAGE` and the request is dropped before a Claude session is ever spawned.
+- **Where** — only channel IDs in `SECURITY_ALLOWED_CHANNELS` are routed to Claude. A message in any other channel is ignored, even from an allowed user (unless they are also in `SECURITY_ADMIN_USERS`, which bypasses the channel check).
+
+Both checks run in the daemon **before** the message reaches a Claude session, so an unauthorized request never costs API tokens, never touches your filesystem, and never executes a tool.
+
+For a hard lock-down, set `SECURITY_STRICT_MODE=true`: an empty allowlist then means "deny everyone" instead of "allow everyone", so you can't accidentally leave a dimension wide open. Combined with `SECURITY_LOG_UNAUTHORIZED=true`, every denial is logged so you can spot probing attempts.
+
+Recommended posture for shared workspaces: `SECURITY_ENABLED=true`, `SECURITY_STRICT_MODE=true`, explicit user and channel lists, and admins only for the people who truly need cross-channel access.
 
 ---
 

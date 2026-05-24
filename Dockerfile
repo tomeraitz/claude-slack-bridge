@@ -1,17 +1,15 @@
 FROM python:3.12-slim
 
-# Install Node.js 20 LTS (required for Claude Code CLI)
+# git, gh (GitHub CLI), and Node.js 20 — all from Debian trixie's default repos
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates curl git gh nodejs npm \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
+
+# Trust bind-mounted repos regardless of host ownership (git ≥ 2.35.4 safe.directory check)
+RUN git config --system --add safe.directory '*'
 
 RUN useradd -m appuser && mkdir -p /home/appuser/.claude && chown appuser:appuser /home/appuser/.claude
 
@@ -24,6 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source and project config
 COPY src/ ./src/
 COPY projects.json .
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 RUN chown -R appuser:appuser /app
 
@@ -31,4 +31,5 @@ USER appuser
 
 WORKDIR /app/src
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "main.py"]

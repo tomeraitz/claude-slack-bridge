@@ -1,0 +1,20 @@
+{
+  "name": "claude-slack-bridge",
+  "owner": {
+    "name": "tomeraitz",
+    "url": "https://github.com/tomeraitz/claude-slack-bridge"
+  },
+  "metadata": {
+    "description": "Plugins for the claude-slack-bridge — drive Claude Code workflows over Slack."
+  },
+  "plugins": [
+    {
+      "name": "full-process",
+      "source": "./plugin",
+      "description": "Drives a full feature-development workflow (clarify -> design -> plan -> execute -> PR -> test) over Slack via the claude-slack-bridge daemon. Ships /process-setup for one-time per-repo configuration and /process for clarification + handoff to the daemon's workflow engine.",
+      "version": "1.0.0",
+      "category": "workflow",
+      "keywords": ["slack", "workflow", "process", "claude-code", "mcp"]
+    }
+  ]
+}

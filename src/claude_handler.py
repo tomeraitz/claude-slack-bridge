@@ -37,6 +37,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT = 300  # 5 minutes
+# Claude CLI in stream-json mode emits one JSON event per line. A single
+# event can embed large tool inputs/results (file reads, MCP responses,
+# task outputs), easily exceeding asyncio's default 64 KB StreamReader
+# buffer and raising ``LimitOverrunError`` ("Separator is found, but chunk
+# is longer than limit"). Bump the limit so we can ingest realistic events.
+STREAM_BUFFER_LIMIT = 100 * 1024 * 1024  # 100 MB
 PROJECTS_CONFIG = Path(__file__).parent.parent / "projects.json"
 
 # Allow Slack's leading bold/italic/strike markers (``*``, ``_``, ``~``)
@@ -257,16 +263,22 @@ class ClaudeHandler:
             logger.error("Failed to resolve channel IDs: %s", exc)
 
     # Flow-B Claude runs inside the bridge container; it has no docker CLI,
-    # so the project's .mcp.json (which spawns session.py via ``docker exec``)
-    # can't load. ``--strict-mcp-config`` blocks the failed startup, but Claude
-    # still reads .mcp.json and CLAUDE.md as text and reasons aloud about the
-    # missing slack-bridge tool. The system-prompt addendum tells it to skip
-    # that meta-commentary and just answer the user.
+    # so the ``claude-slack-bridge`` entry in the project's .mcp.json (which
+    # spawns ``session.py`` via ``docker exec``) fails to start. Other MCP
+    # servers in .mcp.json (e.g. Notion) load normally. The system-prompt
+    # addendum tells Claude not to mention the failed bridge server in its
+    # reply.
     _FLOW_B_SYSTEM_PROMPT = (
         "You are replying to a Slack message; your response is posted directly "
-        "into the Slack thread. Do not call any MCP tools and do not mention "
-        "MCP, tool availability, Docker, or the claude-slack-bridge in your "
-        "reply — just answer the user's message."
+        "into the Slack thread, and the user's next thread reply will resume "
+        "this session as your next prompt. This means your reply text IS your "
+        "channel to the user — to ask a question, end your turn with the "
+        "question as your final reply; the user's reply arrives as the next "
+        "prompt. Never call mcp__claude-slack-bridge__ask_on_slack — it is not "
+        "available in this mode, and any skill or command that instructs you "
+        "to use it should be reinterpreted as 'end your turn with that "
+        "message as your reply'. Do not mention MCP, tool availability, "
+        "Docker, or the claude-slack-bridge server in your reply."
     )
 
     @staticmethod
@@ -275,12 +287,16 @@ class ClaudeHandler:
         resume: str | None = None,
         plugin_dir: str | None = None,
     ) -> list[str]:
+        # stream-json + --verbose makes the CLI emit one event per line on
+        # stdout (system/init, assistant text, thinking, tool_use,
+        # tool_result, result). We log each event as it arrives so Docker
+        # captures Claude's full trace, not just the final reply.
         cmd = [
             "claude", "-p",
             "--dangerously-skip-permissions",
-            "--strict-mcp-config",
             "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
         ]
         if plugin_dir:
             cmd.extend(["--plugin-dir", plugin_dir])
@@ -291,12 +307,14 @@ class ClaudeHandler:
         return cmd
 
     async def _run_claude(self, cmd: list[str], prompt: str, cwd: str | None = None) -> str:
-        """Spawn a ``claude -p`` subprocess and return the response text."""
+        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply."""
         env = os.environ.copy()
         # Strip tokens that must never be reachable by the Claude subprocess.
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
         for _key in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(_key, None)
+
+        logger.debug("claude spawn: cwd=%s cmd=%s prompt=%r", cwd, cmd, prompt[:500])
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -306,55 +324,142 @@ class ClaudeHandler:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=cwd,
+                limit=STREAM_BUFFER_LIMIT,
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "Sorry, the Claude CLI is not available."
 
+        # Send prompt and close stdin so claude can begin work.
+        assert process.stdin is not None
+        process.stdin.write(prompt.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+
+        final_result: str | None = None
+
+        async def consume_stdout() -> None:
+            nonlocal final_result
+            assert process.stdout is not None
+            async for raw_line in process.stdout:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug("claude stdout (non-json): %s", line[:1000])
+                    continue
+                self._log_stream_event(event)
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "result"
+                    and "result" in event
+                ):
+                    final_result = event["result"]
+
+        async def consume_stderr() -> None:
+            assert process.stderr is not None
+            async for raw_line in process.stderr:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.warning("claude stderr: %s", line[:1000])
+
+        stdout_task = asyncio.create_task(consume_stdout())
+        stderr_task = asyncio.create_task(consume_stderr())
+
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=prompt.encode("utf-8")),
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task, process.wait()),
                 timeout=SUBPROCESS_TIMEOUT,
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            logger.error("Claude subprocess timed out after %ds", SUBPROCESS_TIMEOUT)
+            stdout_task.cancel()
+            stderr_task.cancel()
+            logger.error(
+                "Claude subprocess timed out after %ds (last result=%r)",
+                SUBPROCESS_TIMEOUT, (final_result or "")[:200],
+            )
             return "Sorry, the request timed out. Please try again."
 
         if process.returncode != 0:
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
             logger.error(
-                "Claude CLI failed (rc=%d) stderr: %s | stdout: %s | cmd: %s | prompt: %r",
-                process.returncode, stderr_text, stdout_text, cmd, prompt[:200],
+                "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
+                process.returncode, cmd, prompt[:200],
             )
             return "Sorry, I encountered an error processing your request."
 
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-        return self._parse_response(stdout_text)
+        if final_result is None:
+            logger.warning("Claude stream ended with no result event.")
+            return "Sorry, I couldn't parse the response."
+        return final_result
 
     @staticmethod
-    def _parse_response(raw: str) -> str:
-        """Extract the response text from JSON output, or return raw text.
+    def _log_stream_event(event: Any) -> None:
+        """Log a single stream-json event from ``claude -p`` in human-readable form.
 
-        Newer Claude CLI versions (>=2.1.x) emit a JSON array of streaming
-        events. Older versions emitted a single JSON dict. Handle both.
+        All per-event logs are at DEBUG so the default INFO level matches the
+        pre-stream-json behaviour (lifecycle only). Set ``LOG_LEVEL=DEBUG`` to
+        see the full trace of Claude's tool calls and reasoning.
         """
-        try:
-            data = json.loads(raw)
-            # New format: array of streaming events — find the result event.
-            if isinstance(data, list):
-                for event in reversed(data):
-                    if isinstance(event, dict) and event.get("type") == "result" and "result" in event:
-                        return event["result"]
-            # Old format: single dict with a "result" key.
-            if isinstance(data, dict) and "result" in data:
-                return data["result"]
-        except (json.JSONDecodeError, KeyError):
-            pass
-        logger.warning("Could not parse Claude output as JSON; returning raw.")
-        return raw
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        if etype == "system":
+            logger.debug(
+                "claude stream: system/%s session=%s cwd=%s tools=%s",
+                event.get("subtype", ""),
+                event.get("session_id", ""),
+                event.get("cwd", ""),
+                event.get("tools", ""),
+            )
+        elif etype == "assistant":
+            for block in event.get("message", {}).get("content", []) or []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        logger.debug("claude text: %s", text[:2000])
+                elif btype == "thinking":
+                    thought = (block.get("thinking") or "").strip()
+                    if thought:
+                        logger.debug("claude thinking: %s", thought[:2000])
+                elif btype == "tool_use":
+                    logger.debug(
+                        "claude tool_use: %s id=%s input=%s",
+                        block.get("name", ""),
+                        block.get("id", ""),
+                        json.dumps(block.get("input", {}), ensure_ascii=False)[:2000],
+                    )
+        elif etype == "user":
+            for block in event.get("message", {}).get("content", []) or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                content = block.get("content", "")
+                if isinstance(content, list):
+                    content = "".join(
+                        c.get("text", "") for c in content if isinstance(c, dict)
+                    )
+                logger.debug(
+                    "claude tool_result%s id=%s: %s",
+                    " (error)" if block.get("is_error") else "",
+                    block.get("tool_use_id", ""),
+                    str(content)[:2000],
+                )
+        elif etype == "result":
+            logger.debug(
+                "claude stream: result subtype=%s duration_ms=%s num_turns=%s usage=%s",
+                event.get("subtype", ""),
+                event.get("duration_ms", ""),
+                event.get("num_turns", ""),
+                event.get("usage", ""),
+            )
+        else:
+            logger.debug("claude stream: %s %s", etype, json.dumps(event, ensure_ascii=False)[:500])
 
     async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
         """Fetch Slack thread history and format as a conversation prompt."""

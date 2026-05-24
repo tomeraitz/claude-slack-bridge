@@ -7,6 +7,8 @@ services:
     environment:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GH_TOKEN=${GITHUB_TOKEN}
     volumes:
       # Mount Claude CLI credentials (read-only); CLI writes session data inside the container
       - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro

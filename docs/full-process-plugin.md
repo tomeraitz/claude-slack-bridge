@@ -2,6 +2,10 @@
 
 A turnkey feature-development workflow driven entirely from Slack. You pick a task, the bot creates a git worktree, walks the work through your configured steps (typically **design → plan → run-plan**), opens a GitHub PR after each step, and waits for your approval in Slack before moving on.
 
+<img width="768" height="432" alt="full-process-canava (1)" src="https://github.com/user-attachments/assets/90df2046-20a0-478e-92b3-6d1cc09339a3" />
+
+
+
 The plugin lives at [plugin/](../plugin/) in this repo and ships two top-level slash commands:
 
 | Command | Where it runs | What it does |

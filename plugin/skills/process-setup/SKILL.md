@@ -1,6 +1,6 @@
 ---
 name: process-setup
-description: "One-time per-repo configuration for the /process workflow. Delegates verification that mcp__claude-slack-bridge is installed (via the verify-bridge skill), task-manager setup end-to-end (via the build-task-manager skill, which generates `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`), and workflow-steps capture end-to-end (via the build-workflow skill, which collects or scaffolds the user-defined slash commands, injects /review between steps, and ensures /required-fixes at the tail). Use when the user runs /process-setup or asks to set up / re-configure the /process workflow for this repository."
+description: "One-time per-repo configuration for the /process workflow. Delegates verification that mcp__claude-slack-bridge is installed (via the verify-bridge skill), task-manager setup end-to-end (via the build-task-manager skill, which generates `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`), and the three workflow phases — design, plan, and run-plan — each via its own leaf skill (`build-design-workflow`, `build-plan-workflow`, `build-run-plan-flow`) spawned directly so AskUserQuestion is never nested more than one level deep. Use when the user runs /process-setup or asks to set up / re-configure the /process workflow for this repository."
 ---
 
 # /process-setup — one-time per-repo configuration
@@ -58,22 +58,48 @@ Either way, continue to Step 3. Do not re-implement any of the task-manager flow
 
 ## Step 3 — capture workflow steps (delegated, end-to-end)
 
-Delegate the entire workflow-steps phase to the `build-workflow` skill via the Agent tool with `run_in_background: true`. The subagent owns asking whether an AI workflow already exists, either collecting references to the user's existing slash commands or scaffolding starter command files for them, and confirming the final list with the user. Keeping all of this in a separate context window keeps the orchestrator's context clean.
+The workflow has three phases — design, plan, and run-plan. Each is owned by its own leaf skill (`build-design-workflow`, `build-plan-workflow`, `build-run-plan-flow`). Spawn one Agent per phase, sequentially, each in its own context window so the orchestrator stays clean. Run them as direct subagents of this skill — do **not** introduce an intermediate orchestrator subagent, because `AskUserQuestion` does not work reliably from subagents nested more than one level deep.
+
+### Step 3a — design phase
 
 ```
 Agent({
-  description: "Capture workflow steps end-to-end",
+  description: "Configure design phase",
   subagent_type: "general-purpose",
-  prompt: "Read plugin/skills/build-workflow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. You will create `.claude/commands/<name>.md` scaffolds for any steps that don't already have a backing command file. Do not write `.claude/process-template.json` — that is the caller's job. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the confirmed `steps` array.",
+  prompt: "Read plugin/skills/build-design-workflow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the result.",
   run_in_background: true
 })
 ```
 
-When the subagent's completion notification arrives, parse its JSON return block and record:
-- `status` — must be `configured`.
-- `steps` — the confirmed array of `{name, command, reference}` entries, in order.
+When the subagent's completion notification arrives, parse its JSON return block and record it as `design_result`.
 
-Do not re-implement any of the workflow-steps flow inline here — `build-workflow` is the single source of truth for that phase, including writing the `.claude/commands/*.md` scaffolds.
+### Step 3b — plan phase
+
+```
+Agent({
+  description: "Configure plan phase",
+  subagent_type: "general-purpose",
+  prompt: "Read plugin/skills/build-plan-workflow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the result.",
+  run_in_background: true
+})
+```
+
+Record the parsed JSON as `plan_result`.
+
+### Step 3c — run-plan phase
+
+```
+Agent({
+  description: "Configure run-plan phase",
+  subagent_type: "general-purpose",
+  prompt: "Read plugin/skills/build-run-plan-flow/SKILL.md (resolve the plugin root via ${CLAUDE_PLUGIN_ROOT} if set, otherwise search upward from cwd until you find plugin.json) and follow it exactly, top to bottom. Use AskUserQuestion for all user clarifications. End your final reply with the fenced JSON return block specified by the skill so the caller can parse the result.",
+  run_in_background: true
+})
+```
+
+Record the parsed JSON as `run_plan_result`.
+
+Do not re-implement any of the per-phase flows inline here — each leaf skill is the single source of truth for its phase, including writing its own `.claude/skills/claude-slack-bridge_<phase>/SKILL.md`.
 
 ---
 

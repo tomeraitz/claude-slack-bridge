@@ -23,14 +23,12 @@ class SessionBroker:
     Coordinates a single request/reply cycle over the daemon Unix socket.
 
     Args:
-        post_message:    Async callable that posts to Slack and returns thread_ts.
-                         Signature: (text, thread_ts | None) -> thread_ts.
-        timeout_minutes: Seconds to wait for a reply before raising RuntimeError.
+        post_message: Async callable that posts to Slack and returns thread_ts.
+                      Signature: (text, thread_ts | None) -> thread_ts.
     """
 
-    def __init__(self, post_message: PostMessageFn, timeout_minutes: int = 5) -> None:
+    def __init__(self, post_message: PostMessageFn) -> None:
         self._post_message = post_message
-        self._timeout = timeout_minutes * 60.0
         self._thread_ts: str | None = None
 
     async def send_and_wait(self, message: str, label: str | None = None) -> str:
@@ -45,9 +43,6 @@ class SessionBroker:
 
         Returns:
             The text of the first human reply received.
-
-        Raises:
-            RuntimeError: If no reply arrives within the configured timeout.
         """
         thread_ts = await self._post_message(message, self._thread_ts, label)
         if self._thread_ts is None:
@@ -59,17 +54,9 @@ class SessionBroker:
             writer.write(f"REGISTER {thread_ts}\n".encode())
             await writer.drain()
 
-            reply_bytes = await asyncio.wait_for(
-                reader.readline(), timeout=self._timeout
-            )
+            reply_bytes = await reader.readline()
             reply = reply_bytes.decode().strip()
             logger.info("Received reply for thread %s.", thread_ts)
             return reply
-
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"No reply received within {int(self._timeout // 60)} minutes "
-                f"for thread {thread_ts}."
-            )
         finally:
             writer.close()

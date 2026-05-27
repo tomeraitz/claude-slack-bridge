@@ -38,7 +38,6 @@ Recommended posture for shared workspaces: `SECURITY_ENABLED=true`, `SECURITY_ST
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `SLACK_CHANNEL` | Yes | — | Target channel name or ID (e.g. `#my-project`) |
-| `TIMEOUT_LIMIT_MINUTES` | No | `5` | Minutes to wait before timing out |
 
 Set `SLACK_CHANNEL` per project so each project posts to its own dedicated channel.
 
@@ -92,7 +91,6 @@ Claude calls this tool automatically whenever it needs a human decision it canno
 
 - **Input:** `message` — the question or statement to send.
 - **Output:** the text of your reply.
-- **Timeout:** raises an error if no reply arrives within `TIMEOUT_LIMIT_MINUTES`.
 
 > **Reply in the thread.** When the message appears in Slack, click **Reply** to open the thread and type your answer there. A top-level message in the channel will not be picked up.
 

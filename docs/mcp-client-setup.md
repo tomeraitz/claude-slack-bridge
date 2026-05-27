@@ -25,7 +25,7 @@ The bridge uses a **daemon + session** model:
 - The **daemon** (persistent container) holds the Slack Socket Mode WebSocket and a Unix socket server at `/tmp/slack-bridge.sock` inside the container.
 - Each Claude session runs **`session.py`** inside the container via `docker exec`. It posts messages to Slack and blocks on the Unix socket until the daemon delivers the reply — zero polling.
 
-Your `.mcp.json` only needs `SLACK_CHANNEL` (and optionally `TIMEOUT_LIMIT_MINUTES`). The tokens (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) are already inside the container from `.env`.
+Your `.mcp.json` only needs `SLACK_CHANNEL`. The tokens (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) are already inside the container from `.env`.
 
 ---
 
@@ -41,13 +41,11 @@ Create a `.mcp.json` file in the root of any Claude Code project where you want 
       "args": [
         "exec", "-i",
         "-e", "SLACK_CHANNEL",
-        "-e", "TIMEOUT_LIMIT_MINUTES",
         "claude-slack-bridge",
         "python", "session.py"
       ],
       "env": {
-        "SLACK_CHANNEL": "#your-channel",
-        "TIMEOUT_LIMIT_MINUTES": "5"
+        "SLACK_CHANNEL": "#your-channel"
       }
     }
   }
@@ -55,7 +53,6 @@ Create a `.mcp.json` file in the root of any Claude Code project where you want 
 ```
 
 > **Tip:** Set `SLACK_CHANNEL` per project so each project posts to its own dedicated channel.
-> `TIMEOUT_LIMIT_MINUTES` is optional — omit it to use the default of `5`.
 
 ---
 
@@ -85,7 +82,6 @@ Your `.mcp.json` is project-specific. Add it to `.gitignore`:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `SLACK_CHANNEL` | Yes | — | Channel name or ID (e.g. `#my-project`) |
-| `TIMEOUT_LIMIT_MINUTES` | No | `5` | Minutes to wait for a reply before timing out |
 
 ---
 

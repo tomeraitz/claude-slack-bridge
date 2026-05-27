@@ -58,10 +58,7 @@ async def run(config: Config) -> None:
         logger.info("Posted to %s, thread_ts=%s", config.slack_channel, thread_ts or ts)
         return thread_ts or ts
 
-    broker = SessionBroker(
-        post_message=post_message,
-        timeout_minutes=config.timeout_limit_minutes,
-    )
+    broker = SessionBroker(post_message=post_message)
     mcp_server = MCPServer(broker=broker)
     mcp = FastMCP(name="ClaudeSlackBridge")
     mcp_server.register(mcp)

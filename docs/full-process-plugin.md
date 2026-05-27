@@ -45,13 +45,15 @@ Open the repo in Claude Code locally and run:
 /process-setup
 ```
 
-This runs **locally inside Claude Code**, not via Slack. All clarifications go through `AskUserQuestion`. The skill delegates the heavy lifting to four subskills, each in its own context window so the orchestrator stays clean:
+This runs **locally inside Claude Code**, not via Slack. All clarifications go through `AskUserQuestion`. The skill delegates the heavy lifting to several subskills, each in its own context window so the orchestrator stays clean. Each subskill is spawned as a direct child of `process-setup` (no intermediate orchestrator) because `AskUserQuestion` does not work reliably from subagents nested more than one level deep:
 
 | Subskill | What it does |
 |---|---|
 | `verify-bridge` | Reads `.mcp.json` and confirms a `claude-slack-bridge` entry exists under `mcpServers`. Fails fast with a fix-it message if not. |
 | `build-task-manager` | Asks which task manager you use (Notion, Linear, Jira, etc.), how to integrate (MCP server, CLI, REST), captures the concrete invocation and scope, smoke-tests the fetch, and writes `.claude/skills/claude-slack-bridge_list-tasks/SKILL.md`. |
-| `build-workflow` | Asks whether you already have a workflow (slash commands for design/plan/run-plan) and either references your existing commands or scaffolds starter files at `.claude/commands/<name>.md`. Confirms the final ordered list. |
+| `build-design-workflow` | Configures the design phase. Either wraps an existing `/design` flow or bakes an inline design prompt into `.claude/skills/claude-slack-bridge_design/SKILL.md`. |
+| `build-plan-workflow` | Configures the plan phase. Either wraps an existing `/plan` flow or bakes an inline plan prompt into `.claude/skills/claude-slack-bridge_plan/SKILL.md`. |
+| `build-run-plan-flow` | Configures the run-plan (implementation) phase. Either wraps an existing `/run-plan` flow or bakes an inline implementation prompt into `.claude/skills/claude-slack-bridge_run-plan/SKILL.md`. |
 | `build-process-skill` | Writes `.claude/commands/process.md` — the runtime orchestrator that `/process` from Slack will invoke. Offers keep / overwrite / rename if the file already exists. |
 
 When `/process-setup` finishes, your repo has everything `/process` needs:

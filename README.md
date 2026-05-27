@@ -54,13 +54,11 @@ Create `.mcp.json` in the root of any project where you want Claude to be able t
       "args": [
         "exec", "-i",
         "-e", "SLACK_CHANNEL",
-        "-e", "TIMEOUT_LIMIT_MINUTES",
         "claude-slack-bridge",
         "python", "session.py"
       ],
       "env": {
-        "SLACK_CHANNEL": "#your-project-channel",
-        "TIMEOUT_LIMIT_MINUTES": "5"
+        "SLACK_CHANNEL": "#your-project-channel"
       }
     }
   }

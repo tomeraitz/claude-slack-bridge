@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import session_store
 import uuid
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,35 @@ _WORKTREE_TAG_RE = re.compile(r"^[\s*_~]*\[([^\]]+)\]\s*")
 # Labels become directory names; restrict to a safe alphabet to block
 # path-traversal attempts like ``[../etc]``.
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# A claude -p run that failed (non-zero rc, timeout, or no result event)
+# returns one of these fixed user-facing strings from _run_claude. We treat
+# any of them as a resume failure rather than parsing stderr (brittle).
+_RUN_FAILURE_SENTINELS = frozenset({
+    "Sorry, the Claude CLI is not available.",
+    "Sorry, the request timed out. Please try again.",
+    "Sorry, I encountered an error processing your request.",
+    "Sorry, I couldn't parse the response.",
+})
+
+# A run terminated by a signal (returncode < 0 — e.g. an OOM kill or a
+# deliberate stop) is NOT a transient failure: retrying it just re-executes work
+# that was intentionally or unavoidably halted. Surface a distinct reply that the
+# resume policy does NOT retry. Intentionally NOT in _RUN_FAILURE_SENTINELS.
+_INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
+
+
+def _jsonl_path(cwd: str | None, session_id: str) -> Path:
+    """Local JSONL path for a Claude session.
+
+    Claude Code stores sessions at
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`` where the encoded
+    cwd is the absolute project path with every non-alphanumeric character
+    replaced by ``-`` (e.g. ``/home/node/proj/x`` → ``-home-node-proj-x``).
+    """
+    abs_cwd = os.path.abspath(cwd) if cwd else os.getcwd()
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", abs_cwd)
+    return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
 
 
 def _parse_worktree_tag(text: str) -> tuple[str | None, str]:
@@ -114,8 +144,9 @@ class ClaudeHandler:
         slack_client: An async Slack WebClient (``self._app.client``).
     """
 
-    def __init__(self, slack_client: Any) -> None:
+    def __init__(self, slack_client: Any, *, store_path: "Path | None" = None) -> None:
         self._slack_client = slack_client
+        self._store_path = store_path or session_store.SESSIONS_PATH
         self._bot_user_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._project_map: dict[str, Any] = _load_project_map()
@@ -132,6 +163,12 @@ class ClaudeHandler:
         self._bot_user_id = resp["user_id"]
         logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
 
+        for thread_ts, rec in session_store.load(self._store_path).items():
+            sid = rec.get("session_id")
+            if sid:
+                self._sessions[thread_ts] = sid
+            self._thread_config[thread_ts] = (rec.get("cwd"), rec.get("plugin_dir"))
+
         if self._project_map:
             await self._resolve_channel_ids()
 
@@ -147,29 +184,69 @@ class ClaudeHandler:
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
         self._thread_config[message_ts] = (project_dir, plugin_dir)
+        session_store.upsert(
+            message_ts, session_id=session_id, cwd=project_dir,
+            plugin_dir=plugin_dir, in_flight=False, pid=None,
+            path=self._store_path,
+        )
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, text, cwd=project_dir)
+        return await self._run_claude(cmd, text, cwd=project_dir, thread_ts=message_ts, channel=channel)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
-        """Handle a threaded reply (resume existing session or fallback)."""
+        """Handle a threaded reply: resume the real session, else scrape once.
+
+        Policy ("scrape once, then resume forever"):
+          1. session_id present AND its jsonl exists  -> --resume; on failure
+             retry once; if it still fails -> scrape fallback.
+          2. session_id present but jsonl missing      -> scrape fallback.
+          3. no session_id                             -> scrape fallback.
+        """
         session_id = self._sessions.get(thread_ts)
         # Thread inherits the worktree chosen at start; re-tagging mid-thread
         # would be confusing, so we don't re-parse here. Falls back to default
         # config only if the thread state was lost (container restart).
         project_dir, plugin_dir = self._thread_config.get(thread_ts) or self._get_project_config(channel)
 
-        if session_id:
+        if session_id and _jsonl_path(project_dir, session_id).exists():
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            return await self._run_claude(cmd, text, cwd=project_dir)
+            reply = await self._run_claude(cmd, text, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            if reply not in _RUN_FAILURE_SENTINELS:
+                return reply
+            logger.warning("Resume of %s failed; retrying once.", session_id)
+            reply = await self._run_claude(cmd, text, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            if reply not in _RUN_FAILURE_SENTINELS:
+                return reply
+            logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
+        else:
+            logger.info(
+                "No resumable session for thread %s (session_id=%s) — scraping.",
+                thread_ts, session_id,
+            )
 
-        # Fallback: session lost (container restart) — use thread history as context.
-        logger.info("No session for thread %s, falling back to thread history.", thread_ts)
+        return await self._scrape_and_run(channel, thread_ts, project_dir, plugin_dir)
+
+    async def _scrape_and_run(
+        self, channel: str, thread_ts: str, project_dir: str | None, plugin_dir: str | None
+    ) -> str:
+        """Last-resort fallback: replay scraped thread history under a NEW session.
+
+        Mints a fresh ``--session-id``, runs the scraped prompt, and persists the
+        new id so subsequent replies take the hot --resume path (step 1).
+        """
         prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd(plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, prompt, cwd=project_dir)
+        new_id = str(uuid.uuid4())
+        cmd = self._build_cmd(session_id=new_id, plugin_dir=plugin_dir)
+        reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+        self._sessions[thread_ts] = new_id
+        self._thread_config[thread_ts] = (project_dir, plugin_dir)
+        session_store.upsert(
+            thread_ts, session_id=new_id, cwd=project_dir, plugin_dir=plugin_dir,
+            path=self._store_path,
+        )
+        return reply
 
     # ------------------------------------------------------------------
     # Internals
@@ -306,7 +383,10 @@ class ClaudeHandler:
             cmd.extend(["--resume", resume])
         return cmd
 
-    async def _run_claude(self, cmd: list[str], prompt: str, cwd: str | None = None) -> str:
+    async def _run_claude(
+        self, cmd: list[str], prompt: str, cwd: str | None = None,
+        thread_ts: str | None = None, channel: str | None = None,
+    ) -> str:
         """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply."""
         env = os.environ.copy()
         # Strip tokens that must never be reachable by the Claude subprocess.
@@ -329,6 +409,22 @@ class ClaudeHandler:
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "Sorry, the Claude CLI is not available."
+
+        if thread_ts is not None:
+            session_store.upsert(
+                thread_ts, in_flight=True, pid=process.pid,
+                channel=channel, path=self._store_path,
+            )
+
+        def _mark_finished() -> None:
+            # The subprocess has terminated (cleanly or with an error) — the run
+            # is no longer in flight. Only a run that never reaches a terminal
+            # path (the daemon itself dying mid-run) stays in_flight=true, which
+            # is exactly what boot crash-recovery should surface.
+            if thread_ts is not None:
+                session_store.upsert(
+                    thread_ts, in_flight=False, pid=None, path=self._store_path
+                )
 
         # Send prompt and close stdin so claude can begin work.
         assert process.stdin is not None
@@ -382,6 +478,7 @@ class ClaudeHandler:
                 "Claude subprocess timed out after %ds (last result=%r)",
                 SUBPROCESS_TIMEOUT, (final_result or "")[:200],
             )
+            _mark_finished()
             return "Sorry, the request timed out. Please try again."
 
         if process.returncode != 0:
@@ -389,11 +486,18 @@ class ClaudeHandler:
                 "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
                 process.returncode, cmd, prompt[:200],
             )
+            _mark_finished()
+            if process.returncode < 0:
+                # Killed by a signal (deliberate stop / OOM), not a transient
+                # error — do not let the resume policy retry it.
+                return _INTERRUPTED_REPLY
             return "Sorry, I encountered an error processing your request."
 
         if final_result is None:
             logger.warning("Claude stream ended with no result event.")
+            _mark_finished()
             return "Sorry, I couldn't parse the response."
+        _mark_finished()
         return final_result
 
     @staticmethod

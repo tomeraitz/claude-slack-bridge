@@ -54,12 +54,12 @@ _WORKTREE_TAG_RE = re.compile(r"^[\s*_~]*\[([^\]]+)\]\s*")
 # path-traversal attempts like ``[../etc]``.
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-# A claude -p run that failed (non-zero rc, timeout, or no result event)
-# returns one of these fixed user-facing strings from _run_claude. We treat
-# any of them as a resume failure rather than parsing stderr (brittle).
+# A claude -p run that failed transiently (CLI missing, non-zero rc, or no
+# result event) returns one of these fixed user-facing strings from
+# _run_claude. We treat any of them as a resume failure rather than parsing
+# stderr (brittle). A timeout is deliberately NOT here — see _TIMEOUT_REPLY.
 _RUN_FAILURE_SENTINELS = frozenset({
     "Sorry, the Claude CLI is not available.",
-    "Sorry, the request timed out. Please try again.",
     "Sorry, I encountered an error processing your request.",
     "Sorry, I couldn't parse the response.",
 })
@@ -69,6 +69,13 @@ _RUN_FAILURE_SENTINELS = frozenset({
 # that was intentionally or unavoidably halted. Surface a distinct reply that the
 # resume policy does NOT retry. Intentionally NOT in _RUN_FAILURE_SENTINELS.
 _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
+
+# A run that exceeds SUBPROCESS_TIMEOUT is NOT a transient failure either: the
+# run was making progress but won't fit the window, so retrying (then scraping)
+# just serially re-runs the same expensive work — up to 3× the timeout — while
+# the user sees nothing at all. Surface this immediately and do NOT retry.
+# Intentionally NOT in _RUN_FAILURE_SENTINELS.
+_TIMEOUT_REPLY = "Sorry, the request timed out before it could finish. Try a smaller step or rephrase."
 
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
@@ -479,7 +486,7 @@ class ClaudeHandler:
                 SUBPROCESS_TIMEOUT, (final_result or "")[:200],
             )
             _mark_finished()
-            return "Sorry, the request timed out. Please try again."
+            return _TIMEOUT_REPLY
 
         if process.returncode != 0:
             logger.error(

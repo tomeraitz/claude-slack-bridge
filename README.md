@@ -17,6 +17,7 @@ Slack @bot   ──────────────────▶  claude -
 
 - **`ask_on_slack` MCP tool** — Claude pauses mid-task, posts a question to Slack, blocks until you reply in the thread, then resumes. Multiple concurrent sessions are routed correctly by `thread_ts`.
 - **Project-aware Slack bot** — `@claude-bot` in a Slack channel spawns `claude -p` in the matching project directory inside the container. Supports git worktrees via a `[label]` prefix.
+- **Stop a running task** — react with 🛑 to the message that started a run and the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply.
 - **Full-process plugin** — a turnkey feature-development workflow driven from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
 
 ---
@@ -114,6 +115,12 @@ Then in Slack:
 ```
 
 The bot replies in a thread. Continue the conversation by replying in that thread.
+
+### Stopping a running task
+
+When the bot starts working, it adds a 🛑 reaction to the message that triggered the run. **Click that 🛑 reaction to stop the run** — the bot kills the task (and any subprocesses it spawned), posts `⏹️ Stopped.` in the thread, and discards the partial reply. The reaction is removed automatically once the run ends (whether you stopped it or it finished on its own).
+
+> Requires the `reactions:read` / `reactions:write` scopes and the `reaction_added` event from [docs/slack-setup.md](docs/slack-setup.md). If you set up the app before this feature existed, add them and reinstall the app.
 
 → Full reference (channel formats, `plugin_dir`, worktrees, routing rules): **[docs/slack-to-claude-projects.md](docs/slack-to-claude-projects.md)**
 

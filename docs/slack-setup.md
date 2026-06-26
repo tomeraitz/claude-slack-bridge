@@ -22,6 +22,12 @@
    | `groups:history` | Read replies in private channels |
    | `im:history` | Read replies in DMs |
    | `im:write` | Open DM conversations |
+   | `reactions:read` | Detect the 🛑 stop reaction |
+   | `reactions:write` | Add/remove the 🛑 reaction on running tasks |
+
+   > **Note:** `reactions:read` also unlocks the `reaction_added` bot event in
+   > Step 4. Slack hides that event until this scope is added, so add it here
+   > first.
 
 3. Scroll back up and click **Install to Workspace**
 4. Click **Allow**
@@ -45,12 +51,20 @@
 
 1. In the left sidebar, go to **Event Subscriptions**
 2. Toggle **Enable Events** → ON
-3. Under **Subscribe to bot events**, add:
+3. Under **Subscribe to bot events** (the section with the **Add Bot User
+   Event** button — *not* "Subscribe to events on behalf of users"), add:
    - `message.channels` — messages in public channels
    - `message.groups` — messages in private channels
    - `message.im` — messages in DMs
+   - `reaction_added` — detect the 🛑 reaction used to stop a running task
 4. Click **Save Changes**
 5. Reinstall the app if prompted (**OAuth & Permissions** → **Reinstall to Workspace**)
+
+> **`reaction_added` not in the list?** It only appears under **Subscribe to
+> bot events** once the `reactions:read` scope from Step 2 is added. If you only
+> see it under "Subscribe to events on behalf of users", that's the *user*
+> events section — ignore it; add the `reactions:read` bot scope and `reaction_added`
+> will show up under bot events. Tip: type just `reaction` to filter the list.
 
 ---
 

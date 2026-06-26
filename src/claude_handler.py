@@ -144,6 +144,19 @@ def _load_project_map() -> dict[str, Any]:
     return mapping
 
 
+def _append_attachment_note(prompt: str, files: list[tuple[str, str]]) -> str:
+    """Append a ``[User attached: ...]`` note to *prompt* for downloaded files.
+
+    *files* is the ``(local_path, mimetype)`` list from
+    ``attachments.download_files``. Claude views image paths visually and
+    ``Read``s document paths; only the path + mimetype are passed.
+    """
+    if not files:
+        return prompt
+    parts = ", ".join(f"{path} ({mimetype})" for path, mimetype in files)
+    return f"{prompt}\n\n[User attached: {parts}]"
+
+
 def _descendant_pids(pid: int) -> list[int]:
     """All descendant PIDs of *pid*, via the Linux /proc children interface.
 
@@ -250,7 +263,10 @@ class ClaudeHandler:
     # Public API
     # ------------------------------------------------------------------
 
-    async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
+    async def handle_message(
+        self, channel: str, message_ts: str, text: str,
+        files: list[tuple[str, str]] | None = None,
+    ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         label, text = _parse_worktree_tag(text)
         project_dir, plugin_dir = self._get_project_config(channel, label)
@@ -265,10 +281,14 @@ class ClaudeHandler:
         )
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
+        prompt = _append_attachment_note(text, files or [])
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, text, cwd=project_dir, thread_ts=message_ts, channel=channel)
+        return await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel)
 
-    async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
+    async def handle_thread_reply(
+        self, channel: str, thread_ts: str, text: str,
+        files: list[tuple[str, str]] | None = None,
+    ) -> str:
         """Handle a threaded reply: resume the real session, else scrape once.
 
         Policy ("scrape once, then resume forever"):
@@ -285,12 +305,13 @@ class ClaudeHandler:
 
         if session_id and _jsonl_path(project_dir, session_id).exists():
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
+            prompt = _append_attachment_note(text, files or [])
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            reply = await self._run_claude(cmd, text, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed; retrying once.", session_id)
-            reply = await self._run_claude(cmd, text, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
@@ -300,10 +321,11 @@ class ClaudeHandler:
                 thread_ts, session_id,
             )
 
-        return await self._scrape_and_run(channel, thread_ts, project_dir, plugin_dir)
+        return await self._scrape_and_run(channel, thread_ts, project_dir, plugin_dir, files)
 
     async def _scrape_and_run(
-        self, channel: str, thread_ts: str, project_dir: str | None, plugin_dir: str | None
+        self, channel: str, thread_ts: str, project_dir: str | None, plugin_dir: str | None,
+        files: list[tuple[str, str]] | None = None,
     ) -> str:
         """Last-resort fallback: replay scraped thread history under a NEW session.
 
@@ -311,6 +333,7 @@ class ClaudeHandler:
         new id so subsequent replies take the hot --resume path (step 1).
         """
         prompt = await self._build_thread_prompt(channel, thread_ts)
+        prompt = _append_attachment_note(prompt, files or [])
         new_id = str(uuid.uuid4())
         cmd = self._build_cmd(session_id=new_id, plugin_dir=plugin_dir)
         reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
@@ -444,7 +467,12 @@ class ClaudeHandler:
         "available in this mode, and any skill or command that instructs you "
         "to use it should be reinterpreted as 'end your turn with that "
         "message as your reply'. Do not mention MCP, tool availability, "
-        "Docker, or the claude-slack-bridge server in your reply."
+        "Docker, or the claude-slack-bridge server in your reply. "
+        "To send a file or image back to the user, emit a line by itself of "
+        "the form '@@attach <absolute path>' (one such line per file, the path "
+        "must be an absolute path that exists on disk); the bridge uploads each "
+        "file to the Slack thread and removes the marker line from your reply, "
+        "so write any accompanying explanation as normal text on other lines."
     )
 
     @staticmethod

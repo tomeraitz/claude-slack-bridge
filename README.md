@@ -102,6 +102,15 @@ Map each Slack channel to a project folder:
 }
 ```
 
+**Apply mapping edits without a restart:** `projects.json` is read once at startup. After editing it, reload it live — keeping the Slack connection and any in-flight runs alive — instead of restarting:
+
+```bash
+./reload-mapping.sh        # → "reloaded N channel(s)"
+kill -HUP <daemon-pid>     # no CLI needed; same effect, no confirmation line
+```
+
+The reload affects only *new* threads; conversations already running stay in the directory they started in. See **[docs/reloading-projects.md](docs/reloading-projects.md)**.
+
 ### 3. Rebuild
 
 ```bash

@@ -401,8 +401,40 @@ class ClaudeHandler:
         )
         return path, plugin_dir
 
+    async def reload_projects(self) -> int:
+        """Re-read projects.json and re-resolve channel IDs, live.
+
+        Lets a ``projects.json`` edit take effect without restarting the daemon,
+        so the Slack connection and any in-flight runs are left untouched. It is
+        triggered two ways (see docs/reloading-projects.md):
+
+          * the ``RELOAD`` socket verb, sent by ``reloadctl.py`` (which replies
+            with the channel count so the operator gets confirmation), and
+          * a ``SIGHUP`` to the daemon (the ops idiom, e.g. ``pm2 sendSignal``).
+
+        Only *future* threads are affected: a live thread keeps the
+        ``(cwd, plugin_dir)`` cached in ``_thread_config`` when it started, so a
+        reload can never relocate a running conversation. If the re-resolve
+        fails (e.g. a Slack API error), the previous mapping is preserved.
+
+        Returns the number of channels mapped after the reload.
+        """
+        self._project_map = _load_project_map()
+        if self._project_map:
+            await self._resolve_channel_ids()
+        else:
+            self._channel_id_to_project = {}
+        count = len(self._channel_id_to_project)
+        logger.info("Reloaded project map: %d channel(s) mapped.", count)
+        return count
+
     async def _resolve_channel_ids(self) -> None:
-        """Resolve channel names from project_map to Slack channel IDs."""
+        """Resolve channel names from project_map to Slack channel IDs.
+
+        Builds the mapping in a local dict and swaps it in atomically at the
+        end, so a message arriving mid-reload never observes a partial (or
+        empty) mapping, and a mid-way failure leaves the previous one intact.
+        """
         try:
             result = await self._slack_client.conversations_list(
                 types="public_channel,private_channel", limit=1000,
@@ -415,6 +447,7 @@ class ClaudeHandler:
                 name_to_id[ch["name"]] = ch["id"]
                 name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
 
+            resolved: dict[str, dict] = {}
             for channel_key, value in self._project_map.items():
                 # Normalise the legacy string format and the dict format.
                 if isinstance(value, str):
@@ -429,7 +462,7 @@ class ClaudeHandler:
                 # DM channel IDs (D...) and raw channel IDs (C...) are not
                 # returned by conversations_list — register them directly.
                 if channel_key.startswith(("C", "D")) and channel_key not in name_to_id:
-                    self._channel_id_to_project[channel_key] = config
+                    resolved[channel_key] = config
                     logger.info(
                         "Mapped %s (raw ID) → %s%s",
                         channel_key, config["path"],
@@ -439,7 +472,7 @@ class ClaudeHandler:
 
                 channel_id = name_to_id.get(channel_key)
                 if channel_id:
-                    self._channel_id_to_project[channel_id] = config
+                    resolved[channel_id] = config
                     logger.info(
                         "Mapped %s (ID: %s) → %s%s",
                         channel_key, channel_id, config["path"],
@@ -447,6 +480,8 @@ class ClaudeHandler:
                     )
                 else:
                     logger.warning("Channel %s not found in workspace — skipping.", channel_key)
+
+            self._channel_id_to_project = resolved
 
         except Exception as exc:
             logger.error("Failed to resolve channel IDs: %s", exc)

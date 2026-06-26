@@ -19,6 +19,7 @@ from slack_bolt.async_app import AsyncApp
 from config import Config
 from mcp_server import MCPServer
 from session_broker import SessionBroker
+from slack_markdown import build_markdown_payloads
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,21 +43,24 @@ async def run(config: Config) -> None:
         thread_ts: str | None = None,
         label: str | None = None,
     ) -> str:
-        if thread_ts is None and label:
-            text = f"*[{label}]* {text}"
-        kwargs: dict = dict(
-            channel=config.slack_channel,
-            text=f"<!channel> {text}",
-            mrkdwn=True,
+        payloads = build_markdown_payloads(
+            text,
+            broadcast=True,
+            label=label if thread_ts is None else None,
         )
-        if thread_ts is not None:
-            kwargs["thread_ts"] = thread_ts
-        response = await app.client.chat_postMessage(**kwargs)
-        if not response.get("ok"):
-            raise RuntimeError(f"Slack API error: {response.get('error')}")
-        ts: str = response["ts"]
-        logger.info("Posted to %s, thread_ts=%s", config.slack_channel, thread_ts or ts)
-        return thread_ts or ts
+        root_ts = thread_ts
+        for payload in payloads:
+            kwargs: dict = dict(channel=config.slack_channel, **payload)
+            if root_ts is not None:
+                kwargs["thread_ts"] = root_ts
+            response = await app.client.chat_postMessage(**kwargs)
+            if not response.get("ok"):
+                raise RuntimeError(f"Slack API error: {response.get('error')}")
+            ts: str = response["ts"]
+            if root_ts is None:
+                root_ts = ts
+        logger.info("Posted to %s, thread_ts=%s", config.slack_channel, root_ts)
+        return root_ts  # type: ignore[return-value]
 
     broker = SessionBroker(post_message=post_message)
     mcp_server = MCPServer(broker=broker)

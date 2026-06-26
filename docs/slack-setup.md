@@ -24,10 +24,18 @@
    | `im:write` | Open DM conversations |
    | `reactions:read` | Detect the 🛑 stop reaction |
    | `reactions:write` | Add/remove the 🛑 reaction on running tasks |
+   | `files:read` | Download files a user attaches in Slack |
+   | `files:write` | Upload files the agent sends back (`@@attach`) |
 
    > **Note:** `reactions:read` also unlocks the `reaction_added` bot event in
    > Step 4. Slack hides that event until this scope is added, so add it here
    > first.
+   >
+   > **Note:** `files:read` and `files:write` enable two-way file attachments —
+   > inbound files a user uploads are downloaded for the agent to see, and the
+   > agent can send files back. If you add these after the initial install,
+   > reinstall the app (**OAuth & Permissions** → **Reinstall to Workspace**)
+   > for the new scopes to take effect.
 
 3. Scroll back up and click **Install to Workspace**
 4. Click **Allow**

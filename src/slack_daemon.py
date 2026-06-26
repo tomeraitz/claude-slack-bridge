@@ -20,14 +20,16 @@ from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 
 from claude_handler import ClaudeHandler
+from crash_recovery import recover_interrupted_runs
 from security import AccessControl, SecurityConfig
+from slack_markdown import build_markdown_payloads
 
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
-SLACK_MAX_MESSAGE_LENGTH = 40000
 
 
 class SlackDaemon:
@@ -230,18 +232,30 @@ class SlackDaemon:
             logger.warning("Failed to remove stop reaction on %s: %s", trigger_ts, exc)
 
     async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
-        """Post a response to Slack, splitting if it exceeds the message length limit."""
-        if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
-            )
-            return
+        """Post a response to Slack, rendering Markdown via a markdown block.
 
-        for i in range(0, len(text), SLACK_MAX_MESSAGE_LENGTH):
-            chunk = text[i : i + SLACK_MAX_MESSAGE_LENGTH]
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=chunk, mrkdwn=True,
-            )
+        Long replies are split under Slack's per-message markdown limit; each
+        piece is posted in the same thread.
+        """
+        for payload in build_markdown_payloads(text):
+            try:
+                await self._app.client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts, **payload
+                )
+            except SlackApiError as exc:
+                # Slack rejects markdown blocks whose tables exceed 10k chars
+                # (and a few other block limits). Fall back to plain text so the
+                # content is still delivered instead of silently dropped.
+                if exc.response.get("error") != "invalid_blocks":
+                    raise
+                logger.warning(
+                    "markdown block rejected (%s); posting as text",
+                    exc.response.get("error"),
+                )
+                await self._app.client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=payload["blocks"][0]["text"], mrkdwn=True,
+                )
 
     async def _handle_session_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -278,6 +292,14 @@ class SlackDaemon:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
+
+        try:
+            recovered = await recover_interrupted_runs(self._app.client)
+            if recovered:
+                logger.warning("Recovered %d interrupted thread(s): %s",
+                               len(recovered), recovered)
+        except Exception as exc:  # noqa: BLE001 — recovery must not block startup
+            logger.error("Crash recovery failed: %s", exc)
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)

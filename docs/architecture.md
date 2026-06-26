@@ -92,3 +92,15 @@ claude-slack-two-way/
 ├── docker-compose.yml
 └── requirements.txt
 ```
+
+---
+
+## Message formatting
+
+Replies and questions are posted to Slack using a Block Kit **`markdown` block**,
+so Claude's standard Markdown — bold, headings, lists, links, code blocks, and
+tables — renders natively. (Slack's `mrkdwn` text dialect cannot represent tables
+or headings, which is why a plain `text` post would show raw `**` and `|` pipes.)
+A short plain-text fallback accompanies each block for notification previews.
+Messages longer than Slack's 12,000-character markdown-block limit are split
+across multiple threaded posts. See `src/slack_markdown.py`.

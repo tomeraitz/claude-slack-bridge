@@ -23,6 +23,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 
 from claude_handler import ClaudeHandler
+from crash_recovery import recover_interrupted_runs
 from security import AccessControl, SecurityConfig
 from slack_markdown import build_markdown_payloads
 
@@ -219,6 +220,14 @@ class SlackDaemon:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
+
+        try:
+            recovered = await recover_interrupted_runs(self._app.client)
+            if recovered:
+                logger.warning("Recovered %d interrupted thread(s): %s",
+                               len(recovered), recovered)
+        except Exception as exc:  # noqa: BLE001 — recovery must not block startup
+            logger.error("Crash recovery failed: %s", exc)
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)

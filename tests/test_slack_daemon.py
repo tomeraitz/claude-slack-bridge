@@ -55,7 +55,7 @@ class TestReactionLifecycle:
     def test_new_message_adds_then_removes_octagonal_sign(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text):
+        async def fake_handle_message(channel, message_ts, text, files=None):
             return "the reply"
 
         async def fake_post(channel, thread_ts, text):
@@ -77,7 +77,7 @@ class TestReactionLifecycle:
     def test_thread_reply_uses_reply_ts_as_trigger(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_reply(channel, thread_ts, text):
+        async def fake_reply(channel, thread_ts, text, files=None):
             return "reply"
 
         async def fake_post(channel, thread_ts, text):
@@ -98,7 +98,7 @@ class TestReactionLifecycle:
     def test_reaction_removed_even_on_error(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def boom(channel, message_ts, text):
+        async def boom(channel, message_ts, text, files=None):
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(d._claude, "handle_message", boom)
@@ -180,7 +180,7 @@ class TestStoppedSuppression:
     def test_stopped_thread_skips_normal_reply(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text):
+        async def fake_handle_message(channel, message_ts, text, files=None):
             # Simulate the user having stopped this run mid-flight.
             d._claude._stopped.add(message_ts)
             return "partial reply that must NOT be posted"
@@ -201,7 +201,7 @@ class TestStoppedSuppression:
     def test_normal_run_still_posts(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text):
+        async def fake_handle_message(channel, message_ts, text, files=None):
             return "normal reply"
 
         posted = []
@@ -222,7 +222,7 @@ class TestStoppedSuppression:
         # the same thread_ts is not silently suppressed.
         d = make_daemon(monkeypatch)
 
-        async def boom(channel, message_ts, text):
+        async def boom(channel, message_ts, text, files=None):
             d._claude._stopped.add(message_ts)
             raise RuntimeError("kaboom")
 
@@ -237,7 +237,7 @@ class TestStoppedSuppression:
         # (keyed on thread_ts, with a distinct trigger_ts).
         d = make_daemon(monkeypatch)
 
-        async def fake_reply(channel, thread_ts, text):
+        async def fake_reply(channel, thread_ts, text, files=None):
             d._claude._stopped.add(thread_ts)
             return "partial reply that must NOT be posted"
 

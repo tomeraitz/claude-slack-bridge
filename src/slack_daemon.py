@@ -50,11 +50,15 @@ class SlackDaemon:
         self._lock = asyncio.Lock()
         self._claude = ClaudeHandler(slack_client=self._app.client)
         self._active_threads: set[str] = set()
+        # Feature C: trigger_ts (the reacted-to message ts) → thread_ts, so a
+        # reaction_added event can find the run to stop.
+        self._trigger_to_thread: dict[str, str] = {}
         self._bot_user_id: str = ""
 
         self._access_control = AccessControl(SecurityConfig.from_env())
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
+        self._app.event("reaction_added")(self._handle_reaction_added)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -79,6 +83,7 @@ class SlackDaemon:
 
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
+        event_ts: str = event.get("ts", "")
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -101,7 +106,7 @@ class SlackDaemon:
         if thread_ts:
             if thread_ts in self._active_threads:
                 return
-            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
+            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, event_ts))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -115,7 +120,7 @@ class SlackDaemon:
         message_ts: str = event.get("ts", "")
         if message_ts in self._active_threads:
             return
-        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text))
+        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text, message_ts))
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
@@ -137,27 +142,94 @@ class SlackDaemon:
         # Delegate to the normal message handler for authorized mentions.
         await self._handle_slack_message(event)
 
-    async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
+    async def _handle_reaction_added(self, event: dict[str, Any]) -> None:
+        """Stop a running Flow-B agent when a non-bot user reacts 🛑 to its trigger."""
+        if event.get("reaction") != "octagonal_sign":
+            return
+        if event.get("user") == self._bot_user_id:
+            return  # ignore the bot's own 🛑 (it adds the reaction itself)
+
+        item = event.get("item") or {}
+        trigger_ts = item.get("ts", "")
+        thread_ts = self._trigger_to_thread.get(trigger_ts)
+        if thread_ts is None:
+            return  # unknown or already-finished run
+
+        channel = item.get("channel", "")
+        killed = await self._claude.stop(thread_ts)
+        if not killed:
+            return  # nothing in flight to stop
+
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text="⏹️ Stopped."
+            )
+        except Exception as exc:
+            logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
+
+    async def _handle_claude_new_message(
+        self, channel: str, message_ts: str, text: str, trigger_ts: str
+    ) -> None:
         """Spawn Claude for a new top-level message and post the response as a thread reply."""
         self._active_threads.add(message_ts)
+        self._trigger_to_thread[trigger_ts] = message_ts
+        await self._add_stop_reaction(channel, trigger_ts)
         try:
             response = await self._claude.handle_message(channel, message_ts, text)
-            await self._post_response(channel, message_ts, response)
+            if message_ts in self._claude._stopped:
+                logger.info("Run for %s was stopped; suppressing reply.", message_ts)
+            else:
+                await self._post_response(channel, message_ts, response)
         except Exception as exc:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
         finally:
+            # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
+            # later run on this thread_ts is not silently suppressed.
+            self._claude._stopped.discard(message_ts)
+            await self._remove_stop_reaction(channel, trigger_ts)
+            self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(message_ts)
 
-    async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str) -> None:
+    async def _handle_claude_thread_reply(
+        self, channel: str, thread_ts: str, text: str, trigger_ts: str
+    ) -> None:
         """Spawn Claude for a thread reply and post the response."""
         self._active_threads.add(thread_ts)
+        self._trigger_to_thread[trigger_ts] = thread_ts
+        await self._add_stop_reaction(channel, trigger_ts)
         try:
             response = await self._claude.handle_thread_reply(channel, thread_ts, text)
-            await self._post_response(channel, thread_ts, response)
+            if thread_ts in self._claude._stopped:
+                logger.info("Run for %s was stopped; suppressing reply.", thread_ts)
+            else:
+                await self._post_response(channel, thread_ts, response)
         except Exception as exc:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
         finally:
+            # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
+            # later run on this thread_ts is not silently suppressed.
+            self._claude._stopped.discard(thread_ts)
+            await self._remove_stop_reaction(channel, trigger_ts)
+            self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(thread_ts)
+
+    async def _add_stop_reaction(self, channel: str, trigger_ts: str) -> None:
+        """Add the 🛑 reaction marking a run as stoppable. Best-effort."""
+        try:
+            await self._app.client.reactions_add(
+                channel=channel, name="octagonal_sign", timestamp=trigger_ts
+            )
+        except Exception as exc:
+            logger.warning("Failed to add stop reaction on %s: %s", trigger_ts, exc)
+
+    async def _remove_stop_reaction(self, channel: str, trigger_ts: str) -> None:
+        """Remove the 🛑 reaction when the run ends by any path. Best-effort."""
+        try:
+            await self._app.client.reactions_remove(
+                channel=channel, name="octagonal_sign", timestamp=trigger_ts
+            )
+        except Exception as exc:
+            logger.warning("Failed to remove stop reaction on %s: %s", trigger_ts, exc)
 
     async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
         """Post a response to Slack, rendering Markdown via a markdown block.

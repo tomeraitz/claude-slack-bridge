@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import session_store
+import signal
 import uuid
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,66 @@ def _load_project_map() -> dict[str, Any]:
     return mapping
 
 
+def _descendant_pids(pid: int) -> list[int]:
+    """All descendant PIDs of *pid*, via the Linux /proc children interface.
+
+    Walked while the tree is still intact (callers MUST snapshot before killing
+    the parent — afterwards the children reparent to init and can't be traced
+    from *pid*). Returns [] if the children interface is unavailable, degrading
+    gracefully to a process-group-only kill.
+    """
+    result: list[int] = []
+    stack = [pid]
+    seen = {pid}
+    while stack:
+        cur = stack.pop()
+        try:
+            with open(f"/proc/{cur}/task/{cur}/children") as fh:
+                kids = [int(x) for x in fh.read().split()]
+        except OSError:
+            continue
+        for kid in kids:
+            if kid not in seen:
+                seen.add(kid)
+                result.append(kid)
+                stack.append(kid)
+    return result
+
+
+def _sigkill(pid: int) -> None:
+    """SIGKILL one pid and its process group; swallow an already-gone process."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """SIGKILL *process* and every descendant.
+
+    Claude Code runs Bash tools and sub-agents in their own sessions/process
+    groups, so killing only the main group leaves them running. So:
+      1. snapshot the whole descendant tree (while it is still intact);
+      2. kill the PARENT first — a SIGKILL'd parent can't spawn anything new;
+      3. kill every snapshotted descendant by pid.
+    The window between snapshot and parent-kill is a few function calls (no
+    awaits), so a child spawned in that gap is vanishingly unlikely.
+    """
+    pid = process.pid
+    descendants = _descendant_pids(pid)   # 1. snapshot first
+    _sigkill(pid)                         # 2. parent first (no respawns)
+    try:
+        process.kill()                   # let asyncio see the process is gone
+    except (ProcessLookupError, OSError):
+        pass
+    for child in descendants:            # 3. the snapshotted children
+        _sigkill(child)
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -163,6 +224,12 @@ class ClaudeHandler:
         # thread_ts → (cwd, plugin_dir) chosen when the thread started, so
         # replies stay in the same worktree without re-tagging.
         self._thread_config: dict[str, tuple[str | None, str | None]] = {}
+        # Feature C: in-memory tracking of in-flight Flow-B subprocesses so a
+        # 🛑 reaction can kill the right run. thread_ts → live subprocess.
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+        # thread_ts values the user stopped, so the daemon can suppress the
+        # (partial) normal reply for that run.
+        self._stopped: set[str] = set()
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID and resolve channel names to IDs."""
@@ -254,6 +321,21 @@ class ClaudeHandler:
             path=self._store_path,
         )
         return reply
+
+    async def stop(self, thread_ts: str) -> bool:
+        """Kill the in-flight Flow-B subprocess for *thread_ts*, if any.
+
+        Marks the thread stopped so the daemon suppresses the partial reply.
+        Returns True when a tracked process was found and killed, else False.
+        """
+        process = self._processes.get(thread_ts)
+        if process is None:
+            return False
+        self._stopped.add(thread_ts)
+        logger.info("Stopping Claude subprocess for thread %s", thread_ts)
+        _kill_process_tree(process)
+        await process.wait()
+        return True
 
     # ------------------------------------------------------------------
     # Internals
@@ -412,12 +494,18 @@ class ClaudeHandler:
                 env=env,
                 cwd=cwd,
                 limit=STREAM_BUFFER_LIMIT,
+                start_new_session=True,
             )
         except FileNotFoundError:
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "Sorry, the Claude CLI is not available."
 
         if thread_ts is not None:
+            # One in-flight process per thread_ts. The daemon's _active_threads
+            # guard prevents a second concurrent run for the same thread, so this
+            # never overwrites a still-tracked process. If that guard is ever
+            # relaxed, this map (and stop()) would need a per-run key instead.
+            self._processes[thread_ts] = process
             session_store.upsert(
                 thread_ts, in_flight=True, pid=process.pid,
                 channel=channel, path=self._store_path,
@@ -433,79 +521,83 @@ class ClaudeHandler:
                     thread_ts, in_flight=False, pid=None, path=self._store_path
                 )
 
-        # Send prompt and close stdin so claude can begin work.
-        assert process.stdin is not None
-        process.stdin.write(prompt.encode("utf-8"))
-        await process.stdin.drain()
-        process.stdin.close()
-
-        final_result: str | None = None
-
-        async def consume_stdout() -> None:
-            nonlocal final_result
-            assert process.stdout is not None
-            async for raw_line in process.stdout:
-                line = raw_line.decode("utf-8", errors="replace").rstrip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.debug("claude stdout (non-json): %s", line[:1000])
-                    continue
-                self._log_stream_event(event)
-                if (
-                    isinstance(event, dict)
-                    and event.get("type") == "result"
-                    and "result" in event
-                ):
-                    final_result = event["result"]
-
-        async def consume_stderr() -> None:
-            assert process.stderr is not None
-            async for raw_line in process.stderr:
-                line = raw_line.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    logger.warning("claude stderr: %s", line[:1000])
-
-        stdout_task = asyncio.create_task(consume_stdout())
-        stderr_task = asyncio.create_task(consume_stderr())
-
         try:
-            await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, process.wait()),
-                timeout=SUBPROCESS_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            stdout_task.cancel()
-            stderr_task.cancel()
-            logger.error(
-                "Claude subprocess timed out after %ds (last result=%r)",
-                SUBPROCESS_TIMEOUT, (final_result or "")[:200],
-            )
-            _mark_finished()
-            return _TIMEOUT_REPLY
+            # Send prompt and close stdin so claude can begin work.
+            assert process.stdin is not None
+            process.stdin.write(prompt.encode("utf-8"))
+            await process.stdin.drain()
+            process.stdin.close()
 
-        if process.returncode != 0:
-            logger.error(
-                "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
-                process.returncode, cmd, prompt[:200],
-            )
-            _mark_finished()
-            if process.returncode < 0:
-                # Killed by a signal (deliberate stop / OOM), not a transient
-                # error — do not let the resume policy retry it.
-                return _INTERRUPTED_REPLY
-            return "Sorry, I encountered an error processing your request."
+            final_result: str | None = None
 
-        if final_result is None:
-            logger.warning("Claude stream ended with no result event.")
+            async def consume_stdout() -> None:
+                nonlocal final_result
+                assert process.stdout is not None
+                async for raw_line in process.stdout:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug("claude stdout (non-json): %s", line[:1000])
+                        continue
+                    self._log_stream_event(event)
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") == "result"
+                        and "result" in event
+                    ):
+                        final_result = event["result"]
+
+            async def consume_stderr() -> None:
+                assert process.stderr is not None
+                async for raw_line in process.stderr:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        logger.warning("claude stderr: %s", line[:1000])
+
+            stdout_task = asyncio.create_task(consume_stdout())
+            stderr_task = asyncio.create_task(consume_stderr())
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task, process.wait()),
+                    timeout=SUBPROCESS_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _kill_process_tree(process)
+                await process.wait()
+                stdout_task.cancel()
+                stderr_task.cancel()
+                logger.error(
+                    "Claude subprocess timed out after %ds (last result=%r)",
+                    SUBPROCESS_TIMEOUT, (final_result or "")[:200],
+                )
+                _mark_finished()
+                return _TIMEOUT_REPLY
+
+            if process.returncode != 0:
+                logger.error(
+                    "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
+                    process.returncode, cmd, prompt[:200],
+                )
+                _mark_finished()
+                if process.returncode < 0:
+                    # Killed by a signal (deliberate stop / OOM), not a transient
+                    # error — do not let the resume policy retry it.
+                    return _INTERRUPTED_REPLY
+                return "Sorry, I encountered an error processing your request."
+
+            if final_result is None:
+                logger.warning("Claude stream ended with no result event.")
+                _mark_finished()
+                return "Sorry, I couldn't parse the response."
             _mark_finished()
-            return "Sorry, I couldn't parse the response."
-        _mark_finished()
-        return final_result
+            return final_result
+        finally:
+            if thread_ts is not None:
+                self._processes.pop(thread_ts, None)
 
     @staticmethod
     def _log_stream_event(event: Any) -> None:

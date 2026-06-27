@@ -12,6 +12,9 @@ services:
     volumes:
       # Mount the full Claude folder with read/write access
       - ${HOME}/.claude:/home/appuser/.claude:rw
+      # Mount the user-scope MCP config file so global mcpServers
+      # (notion, pencil, playwright) are available inside the container
+      - ${HOME}/.claude.json:/home/appuser/.claude.json:rw
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
     restart: unless-stopped

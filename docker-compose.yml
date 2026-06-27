@@ -10,8 +10,8 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GH_TOKEN=${GITHUB_TOKEN}
     volumes:
-      # Mount Claude CLI credentials (read-only); CLI writes session data inside the container
-      - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
+      # Mount the full Claude folder with read/write access
+      - ${HOME}/.claude:/home/appuser/.claude:rw
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
     restart: unless-stopped

@@ -282,6 +282,30 @@ def _clip(text: str, limit: int) -> str:
     return (text[:limit].rsplit(" ", 1)[0] or text[:limit]) + "…"
 
 
+# The live status ticker posts as mrkdwn but shows Claude's own prose, which is
+# standard Markdown. mrkdwn renders **bold** / [text](url) literally, so reduce
+# inline Markdown to plain text — the ticker is an ephemeral status line, not
+# formatted output. Only *paired* markers are stripped, so a lone underscore in
+# snake_case or a spaced "*" survives. Order matters: links and code spans (which
+# may contain "*") first, then bold before italic so "**" isn't read as two
+# italic markers.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_BOLD_RE = re.compile(r"(\*\*|__)(.+?)\1")
+_MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
+_MD_ITALIC_RE = re.compile(r"(?<!\w)([*_])(?!\s)(.+?)(?<!\s)\1(?!\w)")
+
+
+def _strip_inline_md(text: str) -> str:
+    """Reduce inline Markdown in *text* to plain text for the live status ticker."""
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_CODE_RE.sub(r"\1", text)
+    text = _MD_BOLD_RE.sub(r"\2", text)
+    text = _MD_STRIKE_RE.sub(r"\1", text)
+    text = _MD_ITALIC_RE.sub(r"\2", text)
+    return text
+
+
 # Hard ceiling on action lines in one update, so a very busy window can't blow
 # past Slack's block size. Anything beyond is summarised as "…+N earlier".
 _ACTIONS_MAX = 30
@@ -366,7 +390,7 @@ class _ProgressTracker:
         elif btype == "text":
             text = (block.get("text") or "").strip()
             if text:
-                self._push("💬 " + _clip(text.splitlines()[0], 160))
+                self._push("💬 " + _clip(_strip_inline_md(text.splitlines()[0]), 160))
         elif btype == "thinking":
             if (block.get("thinking") or "").strip():
                 self._push("🤔 Thinking…")

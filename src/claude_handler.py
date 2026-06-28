@@ -26,6 +26,7 @@ resulting thread stay in that worktree without re-tagging.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,11 +35,24 @@ import session_store
 import signal
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-SUBPROCESS_TIMEOUT = 300  # 5 minutes
+# A run is killed only after IDLE_TIMEOUT seconds with NO stream activity
+# (genuinely stuck), not on total wall-clock time — so long tasks run to
+# completion and the user stops them with 🛑 instead of hitting a fixed cap.
+# A long Bash/build emits no events while running, so keep this generous; set
+# IDLE_TIMEOUT_SECONDS=0 to disable the watchdog and rely solely on 🛑.
+IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 min
+# Live progress: aggregate stream events and edit a single Slack status
+# message at most once every PROGRESS_INTERVAL seconds (≤0 falls back to 10).
+PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL_SECONDS", "10"))
+
+# A progress callback receives an immutable snapshot of run progress and pushes
+# it to Slack (create/edit a status message). Owned by the daemon; the handler
+# only decides *when* to call it (throttled aggregation + a final summary).
+ProgressCb = Callable[["_Progress"], Awaitable[None]]
 # Claude CLI in stream-json mode emits one JSON event per line. A single
 # event can embed large tool inputs/results (file reads, MCP responses,
 # task outputs), easily exceeding asyncio's default 64 KB StreamReader
@@ -71,12 +85,12 @@ _RUN_FAILURE_SENTINELS = frozenset({
 # resume policy does NOT retry. Intentionally NOT in _RUN_FAILURE_SENTINELS.
 _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
 
-# A run that exceeds SUBPROCESS_TIMEOUT is NOT a transient failure either: the
-# run was making progress but won't fit the window, so retrying (then scraping)
-# just serially re-runs the same expensive work — up to 3× the timeout — while
-# the user sees nothing at all. Surface this immediately and do NOT retry.
-# Intentionally NOT in _RUN_FAILURE_SENTINELS.
-_TIMEOUT_REPLY = "Sorry, the request timed out before it could finish. Try a smaller step or rephrase."
+# A run the idle watchdog kills (no activity for IDLE_TIMEOUT) is NOT a transient
+# failure: it was either making progress and stalled, or genuinely stuck, so
+# retrying (then scraping) just serially re-runs the same expensive work while
+# the user sees nothing. Surface this immediately and do NOT retry. Intentionally
+# NOT in _RUN_FAILURE_SENTINELS.
+_TIMEOUT_REPLY = "Sorry, the run stalled with no activity and was stopped. Try again or break it into a smaller step."
 
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
@@ -217,6 +231,173 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
         _sigkill(child)
 
 
+# ----------------------------------------------------------------------
+# Live progress (derived purely from the stream-json the CLI already emits —
+# no extra LLM calls). The tracker accumulates events; the handler renders a
+# snapshot at most once per PROGRESS_INTERVAL and a final summary at the end.
+# ----------------------------------------------------------------------
+
+# tool name -> (emoji, present-tense verb) for the live status line.
+_TOOL_VERB: dict[str, tuple[str, str]] = {
+    "Read": ("📖", "Reading"),
+    "Edit": ("✏️", "Editing"),
+    "Write": ("✏️", "Writing"),
+    "MultiEdit": ("✏️", "Editing"),
+    "NotebookEdit": ("✏️", "Editing"),
+    "Bash": ("⚙️", "Running"),
+    "Grep": ("🔍", "Searching"),
+    "Glob": ("🔍", "Searching"),
+    "WebFetch": ("🌐", "Fetching"),
+    "WebSearch": ("🌐", "Searching"),
+    "Task": ("🤖", "Delegating to a subagent"),
+    "TodoWrite": ("📝", "Planning"),
+}
+# Tools that mutate files — counted toward the "N files changed" tally.
+_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact human duration: ``45s``, ``2m14s``, ``1h03m``."""
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+class _Progress(NamedTuple):
+    """An immutable progress snapshot handed to the daemon's ProgressCb.
+
+    ``live`` is the one-line status shown while running; ``summary`` is the
+    collapsed end-state (one headline + an auto-collapsed detail block).
+    ``done`` tells the callback to render ``summary`` instead of ``live``.
+    """
+
+    live: str
+    summary: str
+    done: bool
+
+
+class _ProgressTracker:
+    """Folds a stream of claude events into a renderable progress snapshot.
+
+    Deterministic and side-effect-free (no clock of its own, no I/O): callers
+    pass ``now`` so elapsed time is testable. ``dirty`` flags whether anything
+    changed since the last ``snapshot`` so the throttle can skip no-op edits.
+    """
+
+    def __init__(self, start: float) -> None:
+        self._start = start
+        self._action = "Working…"
+        self._tool_count = 0
+        self._files: list[str] = []          # ordered, unique edited/written paths
+        self._file_set: set[str] = set()
+        self._reads = 0
+        self._commands: list[str] = []       # first line of each Bash command
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def ingest(self, event: Any) -> None:
+        """Update state from one stream-json event (assistant/tool blocks)."""
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            return
+        for block in event.get("message", {}).get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                self._ingest_tool(block)
+            elif btype == "text":
+                text = (block.get("text") or "").strip()
+                if text:
+                    self._action = "💬 " + text.splitlines()[0][:80]
+                    self._dirty = True
+            elif btype == "thinking":
+                if (block.get("thinking") or "").strip():
+                    self._action = "🤔 Thinking…"
+                    self._dirty = True
+
+    def _ingest_tool(self, block: dict) -> None:
+        name = block.get("name", "") or "Tool"
+        inp = block.get("input", {}) or {}
+        self._tool_count += 1
+        emoji, verb = _TOOL_VERB.get(name, ("🔧", name))
+        arg = ""
+        if name in _EDIT_TOOLS:
+            path = inp.get("file_path") or inp.get("notebook_path") or ""
+            if path:
+                if path not in self._file_set:
+                    self._file_set.add(path)
+                    self._files.append(path)
+                arg = f"`{os.path.basename(path)}`"
+        elif name == "Read":
+            self._reads += 1
+            path = inp.get("file_path") or ""
+            arg = f"`{os.path.basename(path)}`" if path else ""
+        elif name == "Bash":
+            cmd = (inp.get("command") or "").strip()
+            if cmd:
+                first = cmd.splitlines()[0]
+                self._commands.append(first)
+                arg = f"`{first[:60]}`"
+        elif name in ("Grep", "Glob"):
+            pat = inp.get("pattern") or inp.get("query") or ""
+            arg = f"`{pat[:50]}`" if pat else ""
+        elif name in ("WebFetch", "WebSearch"):
+            ref = inp.get("url") or inp.get("query") or ""
+            arg = f"`{ref[:50]}`" if ref else ""
+        self._action = f"{emoji} {verb} {arg}".strip()
+        self._dirty = True
+
+    def _tally(self) -> list[str]:
+        parts: list[str] = []
+        if self._files:
+            parts.append(f"{len(self._files)} file{'s' if len(self._files) != 1 else ''}")
+        parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
+        return parts
+
+    def snapshot(self, now: float, *, done: bool = False) -> _Progress:
+        """Render the current state; clears ``dirty``."""
+        self._dirty = False
+        elapsed = _fmt_duration(now - self._start)
+        live = " · ".join([f"🔄 {self._action}", *self._tally(), elapsed])
+        summary = self._render_summary(elapsed)
+        return _Progress(live=live, summary=summary, done=done)
+
+    def _render_summary(self, elapsed: str) -> str:
+        head_parts: list[str] = []
+        if self._files:
+            head_parts.append(
+                f"{len(self._files)} file{'s' if len(self._files) != 1 else ''} changed"
+            )
+        head_parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
+        head_parts.append(elapsed)
+        head = "✅ Done · " + " · ".join(head_parts)
+
+        detail: list[str] = []
+        if self._files:
+            names = [os.path.basename(p) for p in self._files]
+            shown = ", ".join(names[:15])
+            if len(names) > 15:
+                shown += f", +{len(names) - 15} more"
+            detail.append(f"Changed: {shown}")
+        if self._reads:
+            detail.append(f"Read {self._reads} file{'s' if self._reads != 1 else ''}")
+        if self._commands:
+            cmds = "; ".join(c[:40] for c in self._commands[:5])
+            if len(self._commands) > 5:
+                cmds += f"; +{len(self._commands) - 5} more"
+            detail.append(f"Ran: {cmds}")
+        if not detail:
+            return head
+        # Fenced block -> Slack auto-collapses it behind "Show more" when long.
+        return head + "\n```\n" + "\n".join(detail) + "\n```"
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -266,6 +447,7 @@ class ClaudeHandler:
     async def handle_message(
         self, channel: str, message_ts: str, text: str,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         label, text = _parse_worktree_tag(text)
@@ -283,11 +465,15 @@ class ClaudeHandler:
 
         prompt = _append_attachment_note(text, files or [])
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel)
+        return await self._run_claude(
+            cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel,
+            progress_cb=progress_cb,
+        )
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Handle a threaded reply: resume the real session, else scrape once.
 
@@ -307,11 +493,17 @@ class ClaudeHandler:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             prompt = _append_attachment_note(text, files or [])
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(
+                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+                progress_cb=progress_cb,
+            )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed; retrying once.", session_id)
-            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(
+                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+                progress_cb=progress_cb,
+            )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
@@ -321,11 +513,14 @@ class ClaudeHandler:
                 thread_ts, session_id,
             )
 
-        return await self._scrape_and_run(channel, thread_ts, project_dir, plugin_dir, files)
+        return await self._scrape_and_run(
+            channel, thread_ts, project_dir, plugin_dir, files, progress_cb=progress_cb,
+        )
 
     async def _scrape_and_run(
         self, channel: str, thread_ts: str, project_dir: str | None, plugin_dir: str | None,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Last-resort fallback: replay scraped thread history under a NEW session.
 
@@ -336,7 +531,10 @@ class ClaudeHandler:
         prompt = _append_attachment_note(prompt, files or [])
         new_id = str(uuid.uuid4())
         cmd = self._build_cmd(session_id=new_id, plugin_dir=plugin_dir)
-        reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+        reply = await self._run_claude(
+            cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+            progress_cb=progress_cb,
+        )
         self._sessions[thread_ts] = new_id
         self._thread_config[thread_ts] = (project_dir, plugin_dir)
         session_store.upsert(
@@ -503,8 +701,16 @@ class ClaudeHandler:
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None,
         thread_ts: str | None = None, channel: str | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
-        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply."""
+        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply.
+
+        There is no wall-clock cap: a run lives until it finishes, the user 🛑s
+        it, or the idle watchdog kills it after IDLE_TIMEOUT seconds with no
+        stream activity. While it runs, *progress_cb* (if given) is invoked with
+        an aggregated :class:`_Progress` snapshot at most once per
+        PROGRESS_INTERVAL, then once more with ``done=True`` for the summary.
+        """
         env = os.environ.copy()
         # Strip tokens that must never be reachable by the Claude subprocess.
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
@@ -557,20 +763,27 @@ class ClaudeHandler:
             process.stdin.close()
 
             final_result: str | None = None
+            loop = asyncio.get_running_loop()
+            tracker = _ProgressTracker(loop.time())
+            last_event = loop.time()
+            flushed_once = False
+            idle_killed = False
 
             async def consume_stdout() -> None:
-                nonlocal final_result
+                nonlocal final_result, last_event
                 assert process.stdout is not None
                 async for raw_line in process.stdout:
                     line = raw_line.decode("utf-8", errors="replace").rstrip()
                     if not line:
                         continue
+                    last_event = loop.time()
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         logger.debug("claude stdout (non-json): %s", line[:1000])
                         continue
                     self._log_stream_event(event)
+                    tracker.ingest(event)
                     if (
                         isinstance(event, dict)
                         and event.get("type") == "result"
@@ -579,29 +792,50 @@ class ClaudeHandler:
                         final_result = event["result"]
 
             async def consume_stderr() -> None:
+                nonlocal last_event
                 assert process.stderr is not None
                 async for raw_line in process.stderr:
                     line = raw_line.decode("utf-8", errors="replace").rstrip()
                     if line:
+                        last_event = loop.time()
                         logger.warning("claude stderr: %s", line[:1000])
+
+            async def monitor() -> None:
+                # Wakes every PROGRESS_INTERVAL to (1) kill genuinely-stuck runs
+                # (no activity for IDLE_TIMEOUT) and (2) push one aggregated
+                # progress update covering everything since the last push.
+                nonlocal flushed_once, idle_killed
+                interval = PROGRESS_INTERVAL if PROGRESS_INTERVAL > 0 else 10.0
+                while True:
+                    await asyncio.sleep(interval)
+                    now = loop.time()
+                    if IDLE_TIMEOUT > 0 and (now - last_event) >= IDLE_TIMEOUT:
+                        idle_killed = True
+                        logger.error(
+                            "Claude run idle for %.0fs (>=%ss) — killing as stuck.",
+                            now - last_event, IDLE_TIMEOUT,
+                        )
+                        _kill_process_tree(process)
+                        return
+                    if progress_cb is not None and tracker.dirty:
+                        try:
+                            await progress_cb(tracker.snapshot(now))
+                            flushed_once = True
+                        except Exception as exc:  # noqa: BLE001 — progress is best-effort
+                            logger.warning("progress update failed: %s", exc)
 
             stdout_task = asyncio.create_task(consume_stdout())
             stderr_task = asyncio.create_task(consume_stderr())
+            monitor_task = asyncio.create_task(monitor())
 
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(stdout_task, stderr_task, process.wait()),
-                    timeout=SUBPROCESS_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                _kill_process_tree(process)
-                await process.wait()
-                stdout_task.cancel()
-                stderr_task.cancel()
-                logger.error(
-                    "Claude subprocess timed out after %ds (last result=%r)",
-                    SUBPROCESS_TIMEOUT, (final_result or "")[:200],
-                )
+                await asyncio.gather(stdout_task, stderr_task, process.wait())
+            finally:
+                monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor_task
+
+            if idle_killed:
                 _mark_finished()
                 return _TIMEOUT_REPLY
 
@@ -621,6 +855,12 @@ class ClaudeHandler:
                 logger.warning("Claude stream ended with no result event.")
                 _mark_finished()
                 return "Sorry, I couldn't parse the response."
+            # Collapse the live status into a final summary — but only if we
+            # ever posted one. Short runs (finished before the first throttle
+            # tick) never created a status message, so stay silent here too.
+            if progress_cb is not None and flushed_once:
+                with contextlib.suppress(Exception):
+                    await progress_cb(tracker.snapshot(loop.time(), done=True))
             _mark_finished()
             return final_result
         finally:

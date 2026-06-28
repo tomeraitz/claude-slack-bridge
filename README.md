@@ -17,6 +17,7 @@ Slack @bot   ──────────────────▶  claude -
 
 - **`ask_on_slack` MCP tool** — Claude pauses mid-task, posts a question to Slack, blocks until you reply in the thread, then resumes. Multiple concurrent sessions are routed correctly by `thread_ts`.
 - **Project-aware Slack bot** — `@claude-bot` in a Slack channel spawns `claude -p` in the matching project directory inside the container. Supports git worktrees via a `[label]` prefix.
+- **Live progress, no timeout** — a run has no wall-clock limit; it works until it finishes or you stop it. While it runs, the bot edits one status message in the thread showing what it's doing (current action + files-changed/tool tally), derived from the CLI's event stream with no extra model calls, then collapses it to a one-line summary. A stuck run (no activity for `IDLE_TIMEOUT_SECONDS`) is killed automatically.
 - **Stop a running task** — react with 🛑 to the message that started a run and the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply.
 - **Full-process plugin** — a turnkey feature-development workflow driven from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
 

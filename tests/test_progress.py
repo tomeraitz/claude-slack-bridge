@@ -9,7 +9,10 @@ import asyncio
 
 import pytest
 
-from claude_handler import _fmt_duration, _Progress, _ProgressTracker
+import claude_handler
+from claude_handler import (
+    _DEFAULT_CONTEXT, _fmt_duration, _model_context, _Progress, _ProgressTracker,
+)
 from slack_daemon import _ProgressReporter
 
 
@@ -132,17 +135,31 @@ def test_tracker_tokens_turns_model_and_ctx():
         {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/x.py"}}]}})
     meta = t.snapshot(now=1.0).meta
     assert "🪙 ↑1k ↓500 ⚡99k" in meta       # in / out / cache tokens
-    assert "ctx 100k/1M" in meta              # used/window (x/z), not a percentage
+    assert "ctx 100k/1M (10%)" in meta        # used/window AND percentage
     assert "1 turn" in meta
     assert "opus-4-8" in meta                 # model, claude- stripped
 
 
 def test_tracker_ctx_uses_per_model_window():
-    # Haiku 4.5 is 200K, not 1M — same prompt size, different window.
+    # Haiku 4.5 is 200K, not 1M — same prompt size, different window/%.
     t = _ProgressTracker(start=0.0)
     t.ingest({"type": "assistant", "message": {"model": "claude-haiku-4-5", "usage": {
         "input_tokens": 100_000, "output_tokens": 1}, "content": []}})
-    assert "ctx 100k/200k" in t.snapshot(now=1.0).meta
+    assert "ctx 100k/200k (50%)" in t.snapshot(now=1.0).meta
+
+
+def test_model_context_loaded_from_config_with_fallback():
+    assert _model_context("claude-opus-4-8") == 1_000_000   # 1M families
+    assert _model_context("claude-sonnet-4-6") == 1_000_000
+    assert _model_context("claude-haiku-4-5") == 200_000    # 200K
+    assert _model_context("some-unknown-model") == _DEFAULT_CONTEXT
+
+
+def test_model_context_falls_back_when_config_missing(monkeypatch, tmp_path):
+    # Point the loader at a non-existent file → built-in windows still work.
+    monkeypatch.setattr(claude_handler, "_MODEL_CONTEXT_CONFIG", tmp_path / "nope.json")
+    windows, default = claude_handler._load_model_context()
+    assert windows["opus"] == 1_000_000 and default == 200_000
 
 
 def test_tracker_model_from_assistant_skips_synthetic():

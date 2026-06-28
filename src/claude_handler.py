@@ -252,7 +252,7 @@ _TOOL_VERB: dict[str, tuple[str, str]] = {
     "Glob": ("🔍", "Searching"),
     "WebFetch": ("🌐", "Fetching"),
     "WebSearch": ("🌐", "Searching"),
-    "Task": ("🤖", "Delegating to a subagent"),
+    "Task": ("🤖", "Subagent"),
     "TodoWrite": ("📝", "Planning"),
 }
 # Tools that mutate files — counted toward the "N files changed" tally.
@@ -341,17 +341,35 @@ _TODOS_MAX = 15
 _FILES_MAX = 60
 # Status icon per todo state (no interactive checkboxes in a posted message).
 _TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
-# Context-window sizes (max input tokens) for the "ctx %" readout, keyed by
-# model substring, per the Claude API model catalog. Current models: Opus
-# 4.6/4.7/4.8, Sonnet 4.6, Fable 5, Mythos 5 are 1M; Haiku 4.5 is 200K.
-_MODEL_CONTEXT = {
-    "haiku": 200_000,      # checked before the 1M families below
+# Context-window sizes (max input tokens) for the "ctx used/window" readout,
+# keyed by model substring. Loaded from model_context.json at the repo root so
+# they can be updated without a code change; the built-in map below is the
+# fallback when the file is missing or malformed.
+_MODEL_CONTEXT_CONFIG = Path(__file__).parent.parent / "model_context.json"
+_BUILTIN_MODEL_CONTEXT = {
+    "haiku": 200_000,
     "fable": 1_000_000,
     "mythos": 1_000_000,
     "opus": 1_000_000,
     "sonnet": 1_000_000,
 }
-_DEFAULT_CONTEXT = 200_000  # conservative fallback for older / unknown models
+
+
+def _load_model_context() -> tuple[dict[str, int], int]:
+    """Return (window-by-substring, default) from model_context.json, or built-ins."""
+    try:
+        with open(_MODEL_CONTEXT_CONFIG) as f:
+            cfg = json.load(f)
+        windows = {str(k).lower(): int(v) for k, v in (cfg.get("windows") or {}).items()}
+        default = int(cfg.get("default", 200_000))
+        if windows:
+            return windows, default
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("model_context.json unusable (%s) — using built-in windows.", exc)
+    return dict(_BUILTIN_MODEL_CONTEXT), 200_000
+
+
+_MODEL_CONTEXT, _DEFAULT_CONTEXT = _load_model_context()
 
 
 def _fmt_tokens(n: int) -> str:
@@ -533,7 +551,12 @@ class _ProgressTracker:
                 self._mcp.add(parts[1])
         emoji, verb = _TOOL_VERB.get(name, ("🔧", name))
         arg = ""
-        if name in _EDIT_TOOLS:
+        if name == "Skill":
+            emoji, verb = "🧩", "Skill"
+            arg = f"`{self._skills[-1]}`" if self._skills else ""
+        elif name.startswith("mcp__"):  # 🔌 <tool> — server is in the MCP line
+            emoji, verb = "🔌", name.split("__")[-1]
+        elif name in _EDIT_TOOLS:
             path = inp.get("file_path") or inp.get("notebook_path") or ""
             if path:
                 if path not in self._file_set:
@@ -555,13 +578,13 @@ class _ProgressTracker:
             if cmd:
                 first = cmd.splitlines()[0]
                 self._commands.append(first)
-                arg = f"`{_clip(first, 70)}`"
+                arg = f"`{_clip(first, 160)}`"
         elif name in ("Grep", "Glob"):
             pat = inp.get("pattern") or inp.get("query") or ""
-            arg = f"`{_clip(pat, 60)}`" if pat else ""
+            arg = f"`{_clip(pat, 120)}`" if pat else ""
         elif name in ("WebFetch", "WebSearch"):
             ref = inp.get("url") or inp.get("query") or ""
-            arg = f"`{_clip(ref, 60)}`" if ref else ""
+            arg = f"`{_clip(ref, 120)}`" if ref else ""
         self._push(f"{emoji} {verb} {arg}".strip())
 
     def _ingest_todos(self, inp: dict) -> None:
@@ -648,8 +671,10 @@ class _ProgressTracker:
         line_b: list[str] = []
         if self._tok_out or self._tok_in:
             line_b.append(self._tokens_str())
-        if self._ctx_last:  # used/window (x/z) — clearer than a >100% percentage
-            line_b.append(f"ctx {_fmt_tokens(self._ctx_last)}/{_fmt_tokens(_model_context(self._model))}")
+        if self._ctx_last:  # used/window AND % (window is per-model, so % stays sane)
+            window = _model_context(self._model)
+            pct = round(self._ctx_last / window * 100)
+            line_b.append(f"ctx {_fmt_tokens(self._ctx_last)}/{_fmt_tokens(window)} ({pct}%)")
         if self._turns:
             line_b.append(f"{self._turns} turn{'s' if self._turns != 1 else ''}")
         if self._model:

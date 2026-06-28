@@ -1,0 +1,11 @@
+{
+  "_comment": "Context window (max input tokens) per model, for the live-status 'ctx used/window' readout. Keys are matched as substrings of the model id (e.g. 'opus' matches claude-opus-4-8). Edit as models change; 'default' is used when no key matches.",
+  "default": 200000,
+  "windows": {
+    "haiku": 200000,
+    "fable": 1000000,
+    "mythos": 1000000,
+    "opus": 1000000,
+    "sonnet": 1000000
+  }
+}

@@ -64,18 +64,40 @@ def test_tracker_counts_unique_files_only():
     assert "3 tools" in snap.meta
 
 
-def test_tracker_shows_last_n_actions_newest_first():
-    t = _ProgressTracker(start=0.0)  # default N=3
-    t.ingest(_assistant(_tool("Read", file_path="/a/one.py")))
-    t.ingest(_assistant(_tool("Edit", file_path="/a/two.py")))
-    t.ingest(_assistant(_tool("Bash", command="pytest")))
-    t.ingest(_assistant(_tool("Read", file_path="/a/four.py")))
+def test_window_shows_all_actions_when_busy():
+    # >floor actions in a single window -> show them all, newest first.
+    t = _ProgressTracker(start=0.0)  # floor=3
+    for f in ("one", "two", "three", "four", "five"):
+        t.ingest(_assistant(_tool("Read", file_path=f"/a/{f}.py")))
     lines = t.snapshot(now=1.0).live.splitlines()
-    assert len(lines) == 3                       # capped at N
-    assert "four.py" in lines[0]                 # newest on top
-    assert "pytest" in lines[1]
-    assert "two.py" in lines[2]
-    assert all("one.py" not in ln for ln in lines)  # oldest dropped
+    assert len(lines) == 5
+    assert "five.py" in lines[0]    # newest on top
+    assert "one.py" in lines[-1]    # oldest at the bottom
+
+
+def test_window_pads_to_floor_when_quiet():
+    # A later window with a single new action still shows the floor (3),
+    # newest first, padded with the most recent earlier actions.
+    t = _ProgressTracker(start=0.0)
+    for f in ("one", "two", "three", "four", "five"):
+        t.ingest(_assistant(_tool("Read", file_path=f"/a/{f}.py")))
+    t.snapshot(now=1.0)  # window 1 consumes the five
+    t.ingest(_assistant(_tool("Read", file_path="/a/six.py")))
+    lines = t.snapshot(now=2.0).live.splitlines()
+    assert len(lines) == 3
+    assert "six.py" in lines[0]     # newest on top
+    assert "five.py" in lines[1]    # then the previous ones, in order
+    assert "four.py" in lines[2]
+
+
+def test_long_narration_is_clipped_with_ellipsis():
+    t = _ProgressTracker(start=0.0)
+    long = "Now it's clear and I owe you a correction so " * 8
+    t.ingest(_assistant(_text(long)))
+    line = t.snapshot(now=1.0).live.splitlines()[0]
+    assert line.startswith("💬 ")
+    assert line.endswith("…")        # clearly truncated, not cut mid-word silently
+    assert not line.endswith(" …")   # trimmed on a word boundary
 
 
 def test_tracker_tracks_line_churn_and_errors():
@@ -185,6 +207,20 @@ def test_reporter_live_message_has_stop_button():
     assert btn is not None
     assert btn["value"] == "T1"      # carries the run's thread_ts for stop()
     assert btn["style"] == "danger"
+    assert btn["text"]["text"] == "🛑"  # icon-only, like the reaction
+
+
+def test_reporter_calls_on_status_posted_once():
+    client = _FakeClient()
+    hits = []
+
+    async def hook():
+        hits.append(True)
+
+    reporter = _ProgressReporter(client, channel="C1", thread_ts="T1", on_status_posted=hook)
+    asyncio.run(reporter(_Progress(live="x", summary="s", done=False)))
+    asyncio.run(reporter(_Progress(live="y", summary="s", done=False)))
+    assert hits == [True]  # fired only when the message first appears
 
 
 def test_reporter_renders_meta_as_context_block():

@@ -274,6 +274,19 @@ def _count_lines(text: str) -> int:
     return text.count("\n") + 1 if text else 0
 
 
+def _clip(text: str, limit: int) -> str:
+    """Trim *text* to ~*limit* chars on a word boundary, adding '…' when cut."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return (text[:limit].rsplit(" ", 1)[0] or text[:limit]) + "…"
+
+
+# Hard ceiling on action lines in one update, so a very busy window can't blow
+# past Slack's block size. Anything beyond is summarised as "…+N earlier".
+_ACTIONS_MAX = 30
+
+
 class _Progress(NamedTuple):
     """An immutable progress snapshot handed to the daemon's ProgressCb.
 
@@ -300,8 +313,13 @@ class _ProgressTracker:
 
     def __init__(self, start: float) -> None:
         self._start = start
-        n = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 3
-        self._recent: deque[str] = deque(maxlen=n)  # rendered actions, oldest→newest
+        self._floor = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 3
+        # Full ordered action history (oldest→newest), capped for memory. We keep
+        # the whole window rather than a fixed ring so nothing is silently
+        # skipped between updates and the order is always strictly newest-first.
+        self._actions: deque[str] = deque(maxlen=200)
+        self._total = 0                      # actions ever recorded
+        self._shown = 0                      # _total at the previous snapshot
         self._tool_count = 0
         self._files: list[str] = []          # ordered, unique edited/written paths
         self._file_set: set[str] = set()
@@ -318,9 +336,10 @@ class _ProgressTracker:
 
     def _push(self, action: str) -> None:
         """Record the newest action, collapsing consecutive duplicates."""
-        if self._recent and self._recent[-1] == action:
+        if self._actions and self._actions[-1] == action:
             return
-        self._recent.append(action)
+        self._actions.append(action)
+        self._total += 1
         self._dirty = True
 
     def ingest(self, event: Any) -> None:
@@ -347,7 +366,7 @@ class _ProgressTracker:
         elif btype == "text":
             text = (block.get("text") or "").strip()
             if text:
-                self._push("💬 " + text.splitlines()[0][:80])
+                self._push("💬 " + _clip(text.splitlines()[0], 160))
         elif btype == "thinking":
             if (block.get("thinking") or "").strip():
                 self._push("🤔 Thinking…")
@@ -375,13 +394,13 @@ class _ProgressTracker:
             if cmd:
                 first = cmd.splitlines()[0]
                 self._commands.append(first)
-                arg = f"`{first[:60]}`"
+                arg = f"`{_clip(first, 70)}`"
         elif name in ("Grep", "Glob"):
             pat = inp.get("pattern") or inp.get("query") or ""
-            arg = f"`{pat[:50]}`" if pat else ""
+            arg = f"`{_clip(pat, 60)}`" if pat else ""
         elif name in ("WebFetch", "WebSearch"):
             ref = inp.get("url") or inp.get("query") or ""
-            arg = f"`{ref[:50]}`" if ref else ""
+            arg = f"`{_clip(ref, 60)}`" if ref else ""
         self._push(f"{emoji} {verb} {arg}".strip())
 
     def _count_edit_churn(self, name: str, inp: dict) -> None:
@@ -412,11 +431,25 @@ class _ProgressTracker:
         return "🔄 " + " · ".join(parts)
 
     def snapshot(self, now: float, *, done: bool = False) -> _Progress:
-        """Render the current state; clears ``dirty``."""
+        """Render the current state; clears ``dirty``.
+
+        Shows every action that happened in this window (since the last
+        snapshot); if fewer than the floor (PROGRESS_ACTIONS) occurred, pads
+        with the most recent earlier ones so at least the floor is visible.
+        Always strictly newest-first.
+        """
         self._dirty = False
         elapsed = _fmt_duration(now - self._start)
-        # Newest action on top.
-        live = "\n".join(reversed(self._recent)) if self._recent else "🔄 Working…"
+        window = self._total - self._shown
+        self._shown = self._total
+        count = max(window, self._floor)
+        overflow = max(0, count - _ACTIONS_MAX)
+        count = min(count, _ACTIONS_MAX, len(self._actions))
+        recent = list(self._actions)[-count:] if count else []
+        lines = list(reversed(recent))  # newest on top
+        if overflow:
+            lines.append(f"…+{overflow} earlier")
+        live = "\n".join(lines) if lines else "🔄 Working…"
         return _Progress(
             live=live, meta=self._tally(elapsed),
             summary=self._render_summary(elapsed), done=done,

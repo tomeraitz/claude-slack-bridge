@@ -260,6 +260,20 @@ class TestStoppedSuppression:
         assert "100.1" not in d._claude._stopped  # flag cleared for next run
 
 
+class TestLiveProgressToggle:
+    def test_reporter_built_when_on(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", True)
+        assert d._make_reporter("C1", "T1", "T1") is not None
+
+    def test_no_reporter_when_off(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", False)
+        assert d._make_reporter("C1", "T1", "T1") is None
+
+
 class TestStopButton:
     def _body(self, value="thread.1", channel="C1"):
         return {

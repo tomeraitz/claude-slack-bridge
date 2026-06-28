@@ -274,6 +274,14 @@ def _count_lines(text: str) -> int:
     return text.count("\n") + 1 if text else 0
 
 
+def _tool_result_text(block: dict) -> str:
+    """Flatten a tool_result block's content (string or list of parts) to text."""
+    content = block.get("content", "")
+    if isinstance(content, list):
+        return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return str(content or "")
+
+
 def _clip(text: str, limit: int) -> str:
     """Trim *text* to ~*limit* chars on a word boundary, adding '…' when cut."""
     text = text.strip()
@@ -309,6 +317,35 @@ def _strip_inline_md(text: str) -> str:
 # Hard ceiling on action lines in one update, so a very busy window can't blow
 # past Slack's block size. Anything beyond is summarised as "…+N earlier".
 _ACTIONS_MAX = 30
+# Max todo lines shown in the live checklist before collapsing the tail.
+_TODOS_MAX = 15
+# Status icon per todo state (no interactive checkboxes in a posted message).
+_TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
+# Approx context-window sizes for the "ctx %" readout, keyed by model substring.
+_MODEL_CONTEXT = {"opus": 200_000, "sonnet": 200_000, "haiku": 200_000}
+_DEFAULT_CONTEXT = 200_000
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: ``950``, ``4.2k``, ``18k``, ``1.2M``."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k".replace(".0k", "k")
+    return str(n)
+
+
+def _short_model(model: str) -> str:
+    """``claude-opus-4-8`` -> ``opus-4-8`` for the status line."""
+    return model[len("claude-"):] if model.startswith("claude-") else model
+
+
+def _model_context(model: str) -> int:
+    m = (model or "").lower()
+    for key, size in _MODEL_CONTEXT.items():
+        if key in m:
+            return size
+    return _DEFAULT_CONTEXT
 
 
 class _Progress(NamedTuple):
@@ -324,6 +361,7 @@ class _Progress(NamedTuple):
     summary: str
     done: bool
     meta: str = ""
+    todos: str = ""  # checklist block (statuses), shown as its own section
 
 
 class _ProgressTracker:
@@ -352,6 +390,17 @@ class _ProgressTracker:
         self._added = 0                      # lines added across edits (churn)
         self._removed = 0                    # lines removed across edits (churn)
         self._errors = 0                     # tool_result blocks flagged is_error
+        self._last_error = ""                # first line of the latest error result
+        self._tool_counts: dict[str, int] = {}  # per-tool-name use counts
+        self._subagents = 0                  # Task tool launches
+        self._todos: list[tuple[str, str]] = []  # (content, status) latest TodoWrite
+        self._turns = 0                      # assistant turns (overridden by result)
+        self._model = ""                     # from system:init
+        self._tok_in = 0
+        self._tok_out = 0
+        self._tok_cache_r = 0                # cache READ tokens (reused context)
+        self._tok_cache_c = 0                # cache CREATION tokens
+        self._ctx_last = 0                   # prompt size of the most recent call
         self._dirty = False
 
     @property
@@ -372,7 +421,12 @@ class _ProgressTracker:
             return
         etype = event.get("type")
         if etype == "assistant":
-            for block in event.get("message", {}).get("content", []) or []:
+            self._turns += 1
+            message = event.get("message") or {}
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                self._add_usage(usage)
+            for block in message.get("content", []) or []:
                 if isinstance(block, dict):
                     self._ingest_assistant_block(block)
         elif etype == "user":
@@ -381,7 +435,34 @@ class _ProgressTracker:
                 if isinstance(block, dict) and block.get("type") == "tool_result" \
                         and block.get("is_error"):
                     self._errors += 1
+                    raw = _tool_result_text(block).strip()
+                    if raw:
+                        self._last_error = _clip(_strip_inline_md(raw.splitlines()[0]), 80)
                     self._dirty = True
+        elif etype == "system":
+            if event.get("model"):
+                self._model = event["model"]
+        elif etype == "result":
+            nt = event.get("num_turns")
+            if isinstance(nt, int) and nt > 0:
+                self._turns = nt
+            usage = event.get("usage")
+            if isinstance(usage, dict) and self._tok_out == 0:
+                self._add_usage(usage)  # fallback when per-turn usage was absent
+            self._dirty = True
+
+    def _add_usage(self, u: dict) -> None:
+        self._tok_in += u.get("input_tokens") or 0
+        self._tok_out += u.get("output_tokens") or 0
+        self._tok_cache_r += u.get("cache_read_input_tokens") or 0
+        self._tok_cache_c += u.get("cache_creation_input_tokens") or 0
+        # Full prompt size of THIS call = fresh input + cached (read + created).
+        self._ctx_last = (
+            (u.get("input_tokens") or 0)
+            + (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0)
+        )
+        self._dirty = True
 
     def _ingest_assistant_block(self, block: dict) -> None:
         btype = block.get("type")
@@ -399,6 +480,11 @@ class _ProgressTracker:
         name = block.get("name", "") or "Tool"
         inp = block.get("input", {}) or {}
         self._tool_count += 1
+        self._tool_counts[name] = self._tool_counts.get(name, 0) + 1
+        if name == "Task":
+            self._subagents += 1
+        elif name == "TodoWrite":
+            self._ingest_todos(inp)
         emoji, verb = _TOOL_VERB.get(name, ("🔧", name))
         arg = ""
         if name in _EDIT_TOOLS:
@@ -442,17 +528,84 @@ class _ProgressTracker:
             self._removed += _count_lines(inp.get("old_string") or "")
             self._added += _count_lines(inp.get("new_string") or "")
 
-    def _tally(self, elapsed: str) -> str:
-        parts: list[str] = []
-        if self._files:
-            parts.append(f"{len(self._files)} file{'s' if len(self._files) != 1 else ''}")
-        if self._added or self._removed:
-            parts.append(f"+{self._added}/−{self._removed}")
-        parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
+    def _ingest_todos(self, inp: dict) -> None:
+        """Capture the latest TodoWrite list (it replaces the whole list each call)."""
+        parsed: list[tuple[str, str]] = []
+        for t in inp.get("todos") or []:
+            if isinstance(t, dict):
+                content = t.get("content") or t.get("activeForm") or ""
+                if content:
+                    parsed.append((content, t.get("status") or "pending"))
+        if parsed:
+            self._todos = parsed
+            self._dirty = True
+
+    # -- rendering helpers --------------------------------------------------
+
+    def _tool_breakdown(self) -> str:
+        """Per-tool counts, busiest first: ``8 read · 5 edit · 3 bash``."""
+        if not self._tool_counts:
+            return "0 tools"
+        ordered = sorted(self._tool_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return " · ".join(f"{n} {name.lower()}" for name, n in ordered[:6])
+
+    def _files_line(self) -> str:
+        """Unmuted line naming the changed files + churn (empty when none)."""
+        if not self._files:
+            return ""
+        churn = f" (+{self._added}/−{self._removed})" if (self._added or self._removed) else ""
+        names = [os.path.basename(p) for p in self._files]
+        shown = ", ".join(names[:10])
+        if len(names) > 10:
+            shown += f", +{len(names) - 10} more"
+        n = len(self._files)
+        return f"📝 *{n} file{'s' if n != 1 else ''} changed*{churn}: {shown}"
+
+    def _todos_block(self) -> str:
+        """Checklist of the current todos with status icons (empty when none)."""
+        if not self._todos:
+            return ""
+        done = sum(1 for _, s in self._todos if s == "completed")
+        lines = [f"📋 *Todos {done}/{len(self._todos)}*"]
+        for content, status in self._todos[:_TODOS_MAX]:
+            icon = _TODO_ICON.get(status, "⬜")
+            lines.append(f"{icon} {_clip(_strip_inline_md(content), 80)}")
+        if len(self._todos) > _TODOS_MAX:
+            lines.append(f"…+{len(self._todos) - _TODOS_MAX} more")
+        return "\n".join(lines)
+
+    def _tokens_str(self) -> str:
+        return (
+            f"🪙 ↑{_fmt_tokens(self._tok_in)} ↓{_fmt_tokens(self._tok_out)}"
+            f" ⚡{_fmt_tokens(self._tok_cache_r)}"
+        )
+
+    def _meta(self, elapsed: str) -> str:
+        """Muted context block: activity line + resource line."""
+        line_a: list[str] = [self._tool_breakdown()]
+        if self._subagents:
+            line_a.append(f"🤖 {self._subagents} subagent{'s' if self._subagents != 1 else ''}")
         if self._errors:
-            parts.append(f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}")
-        parts.append(elapsed)
-        return "🔄 " + " · ".join(parts)
+            err = f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}"
+            if self._last_error:
+                err += f": {self._last_error}"
+            line_a.append(err)
+        line_a.append(elapsed)
+
+        line_b: list[str] = []
+        if self._tok_out or self._tok_in:
+            line_b.append(self._tokens_str())
+        if self._ctx_last:
+            line_b.append(f"ctx {round(self._ctx_last / _model_context(self._model) * 100)}%")
+        if self._turns:
+            line_b.append(f"{self._turns} turn{'s' if self._turns != 1 else ''}")
+        if self._model:
+            line_b.append(_short_model(self._model))
+
+        lines = [" · ".join(line_a)]
+        if line_b:
+            lines.append(" · ".join(line_b))
+        return "\n".join(lines)
 
     def snapshot(self, now: float, *, done: bool = False) -> _Progress:
         """Render the current state; clears ``dirty``.
@@ -474,8 +627,11 @@ class _ProgressTracker:
         if overflow:
             lines.append(f"…+{overflow} earlier")
         live = "\n".join(lines) if lines else "🔄 Working…"
+        files_line = self._files_line()
+        if files_line:  # files shown unmuted, in the main section
+            live += "\n\n" + files_line
         return _Progress(
-            live=live, meta=self._tally(elapsed),
+            live=live, meta=self._meta(elapsed), todos=self._todos_block(),
             summary=self._render_summary(elapsed), done=done,
         )
 
@@ -507,6 +663,19 @@ class _ProgressTracker:
             if len(self._commands) > 5:
                 cmds += f"; +{len(self._commands) - 5} more"
             detail.append(f"Ran: {cmds}")
+        if self._subagents:
+            detail.append(f"Subagents: {self._subagents}")
+        if self._tool_counts:
+            detail.append(f"Tools: {self._tool_breakdown()}")
+        if self._tok_out or self._tok_in:
+            detail.append(f"Tokens: {self._tokens_str()}")
+        resources = []
+        if self._turns:
+            resources.append(f"{self._turns} turns")
+        if self._model:
+            resources.append(_short_model(self._model))
+        if resources:
+            detail.append(" · ".join(resources))
         if not detail:
             return head
         # Fenced block -> Slack auto-collapses it behind "Show more" when long.

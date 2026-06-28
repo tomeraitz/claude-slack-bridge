@@ -44,13 +44,13 @@ def test_fmt_duration(seconds, expected):
 
 # --- _ProgressTracker ------------------------------------------------------
 
-def test_tracker_edit_sets_action_in_live_and_tally_in_meta():
+def test_tracker_edit_action_in_live_files_unmuted_breakdown_in_meta():
     t = _ProgressTracker(start=0.0)
     t.ingest(_assistant(_tool("Edit", file_path="/proj/src/session.py")))
     snap = t.snapshot(now=5.0)
     assert "✏️ Editing `session.py`" in snap.live   # action line
-    assert "1 file" in snap.meta                      # tally in the muted line
-    assert "1 tool" in snap.meta
+    assert "1 file" in snap.live and "session.py" in snap.live  # files unmuted, in section
+    assert "1 edit" in snap.meta                     # per-tool breakdown in muted line
     assert "5s" in snap.meta
 
 
@@ -60,8 +60,8 @@ def test_tracker_counts_unique_files_only():
     t.ingest(_assistant(_tool("Write", file_path="/a/y.py")))
     t.ingest(_assistant(_tool("Edit", file_path="/a/x.py")))  # repeat
     snap = t.snapshot(now=1.0)
-    assert "2 files" in snap.meta  # x.py counted once
-    assert "3 tools" in snap.meta
+    assert "2 files" in snap.live   # x.py counted once, unmuted in the section
+    assert "2 edit" in snap.meta and "1 write" in snap.meta  # per-tool breakdown
 
 
 def test_window_shows_all_actions_when_busy():
@@ -107,9 +107,47 @@ def test_tracker_tracks_line_churn_and_errors():
     t.ingest({"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": True, "content": "boom"}]}})
     snap = t.snapshot(now=1.0)
-    assert "+2/−3" in snap.meta          # 2 lines added, 3 removed (churn)
-    assert "⚠️ 1 error" in snap.meta
+    assert "+2/−3" in snap.live          # churn shown with files (unmuted)
+    assert "⚠️ 1 error: boom" in snap.meta  # error count + last error text
     assert "+2/−3" in snap.summary       # also surfaced in the final summary
+
+
+def test_tracker_tokens_turns_model_and_ctx():
+    t = _ProgressTracker(start=0.0)
+    t.ingest({"type": "system", "subtype": "init", "model": "claude-opus-4-8"})
+    usage = {"input_tokens": 1000, "output_tokens": 500,
+             "cache_read_input_tokens": 99000, "cache_creation_input_tokens": 0}
+    t.ingest({"type": "assistant", "message": {"usage": usage, "content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/x.py"}}]}})
+    meta = t.snapshot(now=1.0).meta
+    assert "🪙 ↑1k ↓500 ⚡99k" in meta       # in / out / cache tokens
+    assert "ctx 50%" in meta                  # (1000+99000)/200000
+    assert "1 turn" in meta
+    assert "opus-4-8" in meta                 # model, claude- stripped
+
+
+def test_tracker_tool_breakdown_and_subagents():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("Read", file_path="/a/a.py")))
+    t.ingest(_assistant(_tool("Read", file_path="/a/b.py")))
+    t.ingest(_assistant(_tool("Task", description="sub")))
+    meta = t.snapshot(now=1.0).meta
+    assert "2 read" in meta            # per-tool breakdown, busiest first
+    assert "🤖 1 subagent" in meta
+
+
+def test_tracker_todos_render_as_checklist():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("TodoWrite", todos=[
+        {"content": "First task", "status": "completed"},
+        {"content": "Second task", "status": "in_progress"},
+        {"content": "Third task", "status": "pending"},
+    ])))
+    todos = t.snapshot(now=1.0).todos
+    assert "📋 *Todos 1/3*" in todos
+    assert "✅ First task" in todos
+    assert "🔄 Second task" in todos
+    assert "⬜ Third task" in todos
 
 
 def test_tracker_dirty_lifecycle():
@@ -149,7 +187,7 @@ def test_tracker_summary_lists_changes_reads_and_commands():
 
 def test_tracker_summary_no_detail_block_when_nothing_tracked():
     t = _ProgressTracker(start=0.0)
-    t.ingest(_assistant(_thinking("hmm")))
+    t.ingest({"type": "system", "subtype": "init"})  # nothing trackable
     summary = t.snapshot(now=3.0, done=True).summary
     assert summary == "✅ Done · 0 tools · 3s"  # headline only, no fence
     assert "```" not in summary
@@ -225,6 +263,19 @@ def test_reporter_renders_meta_as_context_block():
     kinds = [b["type"] for b in blocks]
     assert kinds == ["section", "context"]   # action lines + muted tally, no button
     assert blocks[1]["elements"][0]["text"] == "🔄 1 file · 2 tools · 5s"
+
+
+def test_reporter_renders_todos_as_its_own_section():
+    client = _FakeClient()
+    reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
+    asyncio.run(reporter(_Progress(
+        live="🔄 working", summary="s", done=False,
+        meta="2 read · 5s", todos="📋 *Todos 1/2*\n✅ a\n⬜ b",
+    )))
+    blocks = client.posts[0]["blocks"]
+    kinds = [b["type"] for b in blocks]
+    assert kinds == ["section", "section", "context"]  # actions, todos, tally
+    assert "Todos 1/2" in blocks[1]["text"]["text"]
 
 
 def test_reporter_done_snapshot_renders_summary():

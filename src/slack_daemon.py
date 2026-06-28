@@ -87,10 +87,14 @@ class _ProgressReporter:
         return self._status_ts is not None
 
     def _live_blocks(self, progress: Any) -> list[dict]:
-        """Recent actions as a section + a muted tally context line."""
+        """Recent actions + (optional) todo checklist + a muted tally context line."""
         blocks: list[dict] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": progress.live}}
         ]
+        if getattr(progress, "todos", ""):
+            blocks.append({
+                "type": "section", "text": {"type": "mrkdwn", "text": progress.todos},
+            })
         if progress.meta:
             blocks.append({
                 "type": "context",

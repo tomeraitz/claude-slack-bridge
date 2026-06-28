@@ -274,6 +274,22 @@ def _count_lines(text: str) -> int:
     return text.count("\n") + 1 if text else 0
 
 
+def _edit_churn(name: str, inp: dict) -> tuple[int, int]:
+    """Approximate (added, removed) line churn from an edit tool's input (no real diff)."""
+    if name == "MultiEdit":
+        added = removed = 0
+        for e in inp.get("edits") or []:
+            if isinstance(e, dict):
+                removed += _count_lines(e.get("old_string") or "")
+                added += _count_lines(e.get("new_string") or "")
+        return added, removed
+    if name == "Write":
+        return _count_lines(inp.get("content") or ""), 0
+    if name == "NotebookEdit":
+        return _count_lines(inp.get("new_source") or ""), 0
+    return _count_lines(inp.get("new_string") or ""), _count_lines(inp.get("old_string") or "")  # Edit
+
+
 def _tool_result_text(block: dict) -> str:
     """Flatten a tool_result block's content (string or list of parts) to text."""
     content = block.get("content", "")
@@ -321,6 +337,8 @@ _ACTIONS_MAX = 100
 _ACTIONS_CHARS = 2500
 # Max todo lines shown in the live checklist before collapsing the tail.
 _TODOS_MAX = 15
+# Max per-file lines in the changed-files section (Slack "Show more" collapses it).
+_FILES_MAX = 60
 # Status icon per todo state (no interactive checkboxes in a posted message).
 _TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
 # Context-window sizes (max input tokens) for the "ctx %" readout, keyed by
@@ -372,6 +390,7 @@ class _Progress(NamedTuple):
     done: bool
     meta: str = ""
     todos: str = ""  # checklist block (statuses), shown as its own section
+    files: str = ""  # changed-files block, shown as its own (collapsible) section
 
 
 class _ProgressTracker:
@@ -399,6 +418,10 @@ class _ProgressTracker:
         self._commands: list[str] = []       # first line of each Bash command
         self._added = 0                      # lines added across edits (churn)
         self._removed = 0                    # lines removed across edits (churn)
+        self._file_added: dict[str, int] = {}    # per-file added lines
+        self._file_removed: dict[str, int] = {}  # per-file removed lines
+        self._skills: list[str] = []         # skill names invoked (ordered, unique)
+        self._mcp: set[str] = set()          # MCP server names used (mcp__<server>__*)
         self._errors = 0                     # tool_result blocks flagged is_error
         self._last_error = ""                # first line of the latest error result
         self._tool_counts: dict[str, int] = {}  # per-tool-name use counts
@@ -436,6 +459,9 @@ class _ProgressTracker:
             usage = message.get("usage")
             if isinstance(usage, dict):
                 self._add_usage(usage)
+            model = message.get("model")
+            if model and model != "<synthetic>":  # real id, e.g. claude-opus-4-8
+                self._model = model
             for block in message.get("content", []) or []:
                 if isinstance(block, dict):
                     self._ingest_assistant_block(block)
@@ -495,6 +521,16 @@ class _ProgressTracker:
             self._subagents += 1
         elif name == "TodoWrite":
             self._ingest_todos(inp)
+        elif name == "Skill":
+            sk = inp.get("skill") or inp.get("command") or inp.get("name")
+            if sk:
+                short = str(sk).split(":")[-1]  # "superpowers:brainstorming" -> "brainstorming"
+                if short not in self._skills:
+                    self._skills.append(short)
+        if name.startswith("mcp__"):
+            parts = name.split("__")  # mcp__<server>__<tool>
+            if len(parts) >= 3:
+                self._mcp.add(parts[1])
         emoji, verb = _TOOL_VERB.get(name, ("🔧", name))
         arg = ""
         if name in _EDIT_TOOLS:
@@ -504,7 +540,12 @@ class _ProgressTracker:
                     self._file_set.add(path)
                     self._files.append(path)
                 arg = f"`{os.path.basename(path)}`"
-            self._count_edit_churn(name, inp)
+            a, r = _edit_churn(name, inp)
+            self._added += a
+            self._removed += r
+            if path:
+                self._file_added[path] = self._file_added.get(path, 0) + a
+                self._file_removed[path] = self._file_removed.get(path, 0) + r
         elif name == "Read":
             self._reads += 1
             path = inp.get("file_path") or ""
@@ -523,21 +564,6 @@ class _ProgressTracker:
             arg = f"`{_clip(ref, 60)}`" if ref else ""
         self._push(f"{emoji} {verb} {arg}".strip())
 
-    def _count_edit_churn(self, name: str, inp: dict) -> None:
-        """Approximate +/− line churn from an edit tool's input (no real diff)."""
-        if name == "MultiEdit":
-            for e in inp.get("edits") or []:
-                if isinstance(e, dict):
-                    self._removed += _count_lines(e.get("old_string") or "")
-                    self._added += _count_lines(e.get("new_string") or "")
-        elif name == "Write":
-            self._added += _count_lines(inp.get("content") or "")
-        elif name == "NotebookEdit":
-            self._added += _count_lines(inp.get("new_source") or "")
-        else:  # Edit
-            self._removed += _count_lines(inp.get("old_string") or "")
-            self._added += _count_lines(inp.get("new_string") or "")
-
     def _ingest_todos(self, inp: dict) -> None:
         """Capture the latest TodoWrite list (it replaces the whole list each call)."""
         parsed: list[tuple[str, str]] = []
@@ -553,23 +579,40 @@ class _ProgressTracker:
     # -- rendering helpers --------------------------------------------------
 
     def _tool_breakdown(self) -> str:
-        """Per-tool counts, busiest first: ``8 read · 5 edit · 3 bash``."""
+        """Per-tool counts, busiest first: ``8 read · 5 edit · 3 bash``.
+
+        MCP tools (``mcp__server__tool``) collapse to a single ``mcp`` bucket so
+        their long names don't blow up the line — the servers are listed separately.
+        """
         if not self._tool_counts:
             return "0 tools"
-        ordered = sorted(self._tool_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        return " · ".join(f"{n} {name.lower()}" for name, n in ordered[:6])
+        grouped: dict[str, int] = {}
+        for name, n in self._tool_counts.items():
+            key = "mcp" if name.startswith("mcp__") else name.lower()
+            grouped[key] = grouped.get(key, 0) + n
+        ordered = sorted(grouped.items(), key=lambda kv: (-kv[1], kv[0]))
+        return " · ".join(f"{n} {key}" for key, n in ordered[:6])
 
-    def _files_line(self) -> str:
-        """Unmuted line naming the changed files + churn (empty when none)."""
+    def _files_block(self) -> str:
+        """Own section: a header + one line per changed file with per-file churn.
+
+        Listed in full (capped at _FILES_MAX) so Slack's own "Show more" collapses
+        a long list. Per-file +/− is churn, not a real diff — Slack has no nested
+        collapsible blocks, so true per-file diffs aren't shown.
+        """
         if not self._files:
             return ""
-        churn = f" (+{self._added}/−{self._removed})" if (self._added or self._removed) else ""
-        names = [os.path.basename(p) for p in self._files]
-        shown = ", ".join(names[:10])
-        if len(names) > 10:
-            shown += f", +{len(names) - 10} more"
         n = len(self._files)
-        return f"📝 *{n} file{'s' if n != 1 else ''} changed*{churn}: {shown}"
+        churn = f" (+{self._added}/−{self._removed})" if (self._added or self._removed) else ""
+        lines = [f"📝 *{n} file{'s' if n != 1 else ''} changed*{churn}"]
+        for path in self._files[:_FILES_MAX]:
+            a = self._file_added.get(path, 0)
+            r = self._file_removed.get(path, 0)
+            per = f"  +{a}/−{r}" if (a or r) else ""
+            lines.append(f"• `{os.path.basename(path)}`{per}")
+        if n > _FILES_MAX:
+            lines.append(f"…and {n - _FILES_MAX} more")
+        return "\n".join(lines)
 
     def _todos_block(self) -> str:
         """Checklist of the current todos with status icons (empty when none)."""
@@ -605,16 +648,24 @@ class _ProgressTracker:
         line_b: list[str] = []
         if self._tok_out or self._tok_in:
             line_b.append(self._tokens_str())
-        if self._ctx_last:
-            line_b.append(f"ctx {round(self._ctx_last / _model_context(self._model) * 100)}%")
+        if self._ctx_last:  # used/window (x/z) — clearer than a >100% percentage
+            line_b.append(f"ctx {_fmt_tokens(self._ctx_last)}/{_fmt_tokens(_model_context(self._model))}")
         if self._turns:
             line_b.append(f"{self._turns} turn{'s' if self._turns != 1 else ''}")
         if self._model:
             line_b.append(_short_model(self._model))
 
+        line_c: list[str] = []
+        if self._skills:
+            line_c.append("🧩 " + ", ".join(self._skills[:6]))
+        if self._mcp:
+            line_c.append("🔌 " + ", ".join(sorted(self._mcp)[:6]))
+
         lines = [" · ".join(line_a)]
         if line_b:
             lines.append(" · ".join(line_b))
+        if line_c:
+            lines.append(" · ".join(line_c))
         return "\n".join(lines)
 
     def snapshot(self, now: float, *, done: bool = False) -> _Progress:
@@ -643,12 +694,9 @@ class _ProgressTracker:
         if hidden:
             lines.append(f"… and {hidden} more")
         live = "\n".join(lines) if lines else "🔄 Working…"
-        files_line = self._files_line()
-        if files_line:  # files shown unmuted, in the main section
-            live += "\n\n" + files_line
         return _Progress(
             live=live, meta=self._meta(elapsed), todos=self._todos_block(),
-            summary=self._render_summary(elapsed), done=done,
+            files=self._files_block(), summary=self._render_summary(elapsed), done=done,
         )
 
     def _render_summary(self, elapsed: str) -> str:

@@ -44,12 +44,12 @@ def test_fmt_duration(seconds, expected):
 
 # --- _ProgressTracker ------------------------------------------------------
 
-def test_tracker_edit_action_in_live_files_unmuted_breakdown_in_meta():
+def test_tracker_edit_action_in_live_files_block_breakdown_in_meta():
     t = _ProgressTracker(start=0.0)
     t.ingest(_assistant(_tool("Edit", file_path="/proj/src/session.py")))
     snap = t.snapshot(now=5.0)
     assert "✏️ Editing `session.py`" in snap.live   # action line
-    assert "1 file" in snap.live and "session.py" in snap.live  # files unmuted, in section
+    assert "1 file" in snap.files and "session.py" in snap.files  # own files section
     assert "1 edit" in snap.meta                     # per-tool breakdown in muted line
     assert "5s" in snap.meta
 
@@ -60,8 +60,19 @@ def test_tracker_counts_unique_files_only():
     t.ingest(_assistant(_tool("Write", file_path="/a/y.py")))
     t.ingest(_assistant(_tool("Edit", file_path="/a/x.py")))  # repeat
     snap = t.snapshot(now=1.0)
-    assert "2 files" in snap.live   # x.py counted once, unmuted in the section
+    assert "2 files" in snap.files   # x.py counted once, in the files section
     assert "2 edit" in snap.meta and "1 write" in snap.meta  # per-tool breakdown
+
+
+def test_tracker_files_block_shows_per_file_churn():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("Edit", file_path="/a/x.py",
+                              old_string="a\nb", new_string="a\nB\nC")))
+    t.ingest(_assistant(_tool("Write", file_path="/a/y.py", content="one\ntwo\nthree")))
+    files = t.snapshot(now=1.0).files
+    assert "📝 *2 files changed*" in files
+    assert "`x.py`  +3/−2" in files   # per-file churn (Edit)
+    assert "`y.py`  +3/−0" in files   # Write counts content lines as additions
 
 
 def test_window_shows_all_actions_when_busy():
@@ -107,7 +118,7 @@ def test_tracker_tracks_line_churn_and_errors():
     t.ingest({"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": True, "content": "boom"}]}})
     snap = t.snapshot(now=1.0)
-    assert "+2/−3" in snap.live          # churn shown with files (unmuted)
+    assert "+2/−3" in snap.files         # churn shown in the files section
     assert "⚠️ 1 error: boom" in snap.meta  # error count + last error text
     assert "+2/−3" in snap.summary       # also surfaced in the final summary
 
@@ -121,18 +132,35 @@ def test_tracker_tokens_turns_model_and_ctx():
         {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/x.py"}}]}})
     meta = t.snapshot(now=1.0).meta
     assert "🪙 ↑1k ↓500 ⚡99k" in meta       # in / out / cache tokens
-    assert "ctx 10%" in meta                  # (1000+99000)/1_000_000 — Opus is 1M
+    assert "ctx 100k/1M" in meta              # used/window (x/z), not a percentage
     assert "1 turn" in meta
     assert "opus-4-8" in meta                 # model, claude- stripped
 
 
-def test_tracker_ctx_pct_uses_per_model_window():
-    # Haiku 4.5 is 200K, not 1M — same prompt size reads as a higher %.
+def test_tracker_ctx_uses_per_model_window():
+    # Haiku 4.5 is 200K, not 1M — same prompt size, different window.
     t = _ProgressTracker(start=0.0)
-    t.ingest({"type": "system", "subtype": "init", "model": "claude-haiku-4-5"})
-    t.ingest({"type": "assistant", "message": {"usage": {
+    t.ingest({"type": "assistant", "message": {"model": "claude-haiku-4-5", "usage": {
         "input_tokens": 100_000, "output_tokens": 1}, "content": []}})
-    assert "ctx 50%" in t.snapshot(now=1.0).meta   # 100000/200000
+    assert "ctx 100k/200k" in t.snapshot(now=1.0).meta
+
+
+def test_tracker_model_from_assistant_skips_synthetic():
+    t = _ProgressTracker(start=0.0)
+    t.ingest({"type": "assistant", "message": {"model": "<synthetic>", "content": []}})
+    t.ingest({"type": "assistant", "message": {"model": "claude-opus-4-8", "content": []}})
+    assert "opus-4-8" in t.snapshot(now=1.0).meta   # real id wins; <synthetic> ignored
+
+
+def test_tracker_tracks_skills_and_mcp_servers():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("Skill", skill="superpowers:brainstorming")))
+    t.ingest(_assistant(_tool("mcp__plugin_playwright_playwright__browser_navigate", url="x")))
+    t.ingest(_assistant(_tool("mcp__claude_ai_GoDaddy__domains_suggest", query="y")))
+    meta = t.snapshot(now=1.0).meta
+    assert "🧩 brainstorming" in meta                 # skill, plugin prefix stripped
+    assert "🔌" in meta and "plugin_playwright_playwright" in meta and "claude_ai_GoDaddy" in meta
+    assert "2 mcp" in meta                            # both mcp tools grouped in the breakdown
 
 
 def test_window_caps_actions_and_counts_the_rest():
@@ -295,6 +323,19 @@ def test_reporter_renders_todos_as_its_own_section():
     kinds = [b["type"] for b in blocks]
     assert kinds == ["section", "section", "context"]  # actions, todos, tally
     assert "Todos 1/2" in blocks[1]["text"]["text"]
+
+
+def test_reporter_renders_files_as_its_own_section():
+    client = _FakeClient()
+    reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
+    asyncio.run(reporter(_Progress(
+        live="🔄 working", summary="s", done=False,
+        meta="1 edit · 5s", files="📝 *1 file changed*\n• `x.py`  +3/−1",
+    )))
+    blocks = client.posts[0]["blocks"]
+    kinds = [b["type"] for b in blocks]
+    assert kinds == ["section", "section", "context"]  # actions, files, tally
+    assert "1 file changed" in blocks[1]["text"]["text"]
 
 
 def test_reporter_done_snapshot_renders_summary():

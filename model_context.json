@@ -7,5 +7,13 @@
     "mythos": 1000000,
     "opus": 1000000,
     "sonnet": 1000000
+  },
+  "_prices_comment": "USD per 1M tokens (input, output). Cache read billed ~0.1x input, cache write ~1.25x input — applied automatically to the estimate. Keys matched as substrings of the model id.",
+  "prices": {
+    "haiku": {"in": 1, "out": 5},
+    "fable": {"in": 10, "out": 50},
+    "mythos": {"in": 10, "out": 50},
+    "opus": {"in": 5, "out": 25},
+    "sonnet": {"in": 3, "out": 15}
   }
 }

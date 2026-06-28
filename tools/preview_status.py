@@ -45,9 +45,8 @@ def tool_error(msg):
 # reads, a skill, two MCP tools, a subagent, todos, an error.
 SCENARIO = [
     _assistant(text("Now it's clear — I'll wire the tracker into the daemon and add tests."),
-               model="claude-opus-4-8",
-               usage={"input_tokens": 12000, "output_tokens": 4200,
-                      "cache_read_input_tokens": 368000, "cache_creation_input_tokens": 0}),
+               model="claude-opus-4-8"),
+    {"type": "system", "subtype": "compact_boundary"},  # context auto-compacted
     _assistant(tool("Read", file_path="/proj/src/claude_handler.py")),
     _assistant(tool("Edit", file_path="/proj/src/claude_handler.py",
                     old_string="a\nb\nc\nd", new_string="a\nB")),
@@ -106,10 +105,18 @@ def show(title, progress):
 
 
 def main():
+    # Per-API-call usage: each turn re-reads a large cached prompt (cache_read
+    # accumulates into a big ⚡ total) while the last call's prompt size is what
+    # ctx shows. Mirrors a real long run (↑ small, ↓ small, ⚡ big).
+    per_call = {"input_tokens": 150, "output_tokens": 15,
+                "cache_read_input_tokens": 610000, "cache_creation_input_tokens": 0}
     t = _ProgressTracker(start=0.0)
     for ev in SCENARIO:
+        if ev["type"] == "assistant" and "usage" not in ev["message"]:
+            ev["message"]["usage"] = dict(per_call)
         t.ingest(ev)
     show("LIVE (while running)", t.snapshot(now=134.0))
+    show("LIVE (quiet — idle hint)", t.snapshot(now=180.0, idle=46.0))
     show("FINAL SUMMARY (done)", t.snapshot(now=134.0, done=True))
 
 

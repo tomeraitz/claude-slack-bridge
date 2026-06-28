@@ -87,20 +87,22 @@ class _ProgressReporter:
         return self._status_ts is not None
 
     def _live_blocks(self, progress: Any) -> list[dict]:
-        """Recent actions + (optional) changed-files + todo sections + muted tally."""
-        blocks: list[dict] = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": progress.live}}
-        ]
-        if getattr(progress, "files", ""):  # own section -> Slack "Show more" collapses long lists
-            blocks.append({
-                "type": "section", "text": {"type": "mrkdwn", "text": progress.files},
-            })
+        """Order: todos, recent actions, changed files, then a grey resources line.
+
+        Todos / actions / files are full sections (so a long one gets Slack's own
+        "Show more" collapse); resources are a grey-but-visible context block.
+        """
+        def section(text: str) -> dict:
+            return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+        blocks: list[dict] = []
         if getattr(progress, "todos", ""):
-            blocks.append({
-                "type": "section", "text": {"type": "mrkdwn", "text": progress.todos},
-            })
+            blocks.append(section(progress.todos))
+        blocks.append(section(progress.live))             # recent actions
+        if getattr(progress, "files", ""):
+            blocks.append(section(progress.files))
         if progress.meta:
-            blocks.append({
+            blocks.append({                               # grey, small, but visible
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": progress.meta}],
             })

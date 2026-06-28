@@ -185,9 +185,39 @@ def test_window_caps_actions_and_counts_the_rest():
     for i in range(130):
         t.ingest(_assistant(_tool("Read", file_path=f"/a/f{i}.py")))
     lines = t.snapshot(now=1.0).live.splitlines()
-    assert len(lines) == 101                       # 100 actions + the overflow line
-    assert lines[-1] == "… and 30 more"            # 130 - 100 shown
-    assert "f129.py" in lines[0]                    # newest still on top
+    assert len(lines) == 100                        # 99 actions + the overflow line
+    assert lines[-1] == "… and 31 more"             # 130 - 99 shown
+    assert "f129.py" in lines[0]                     # newest still on top
+
+
+def test_tracker_counts_compactions():
+    t = _ProgressTracker(start=0.0)
+    t.ingest({"type": "system", "subtype": "compact_boundary"})
+    t.ingest(_assistant({"type": "compaction"}))  # API compaction content block
+    assert "🗜️ compacted 2×" in t.snapshot(now=1.0).meta
+
+
+def test_tracker_cost_estimate_format():
+    # ≥ $1 → one decimal; < $1 → two decimals.
+    big = _ProgressTracker(start=0.0)
+    big.ingest({"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {
+        "input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 6_700_000}, "content": []}})
+    assert "($3.4)" in big.snapshot(now=1.0).meta
+
+    small = _ProgressTracker(start=0.0)
+    small.ingest({"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {
+        "input_tokens": 12000, "output_tokens": 4200, "cache_read_input_tokens": 368000}, "content": []}})
+    assert "($0.35)" in small.snapshot(now=1.0).meta
+
+
+def test_tracker_idle_hint_at_top_when_quiet():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("Bash", command="npm run build")))
+    live = t.snapshot(now=60.0, idle=46.0).live
+    assert live.splitlines()[0].startswith("⏳ idle ")
+    # No hint when active (idle below threshold).
+    t.ingest(_assistant(_tool("Read", file_path="/a/x.py")))
+    assert "⏳ idle" not in t.snapshot(now=61.0, idle=2.0).live
 
 
 def test_tracker_tool_breakdown_and_subagents():
@@ -338,8 +368,8 @@ def test_reporter_renders_todos_as_its_own_section():
     )))
     blocks = client.posts[0]["blocks"]
     kinds = [b["type"] for b in blocks]
-    assert kinds == ["section", "section", "context"]  # actions, todos, tally
-    assert "Todos 1/2" in blocks[1]["text"]["text"]
+    assert kinds == ["section", "section", "context"]  # todos, actions, tally
+    assert "Todos 1/2" in blocks[0]["text"]["text"]    # todos on top now
 
 
 def test_reporter_renders_files_as_its_own_section():

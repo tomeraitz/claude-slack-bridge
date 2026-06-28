@@ -51,6 +51,10 @@ IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 min
 PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL_SECONDS", "10"))
 # How many recent actions the live status shows (newest first; ≤0 falls back to 3).
 PROGRESS_ACTIONS = int(os.environ.get("PROGRESS_ACTIONS", "3"))
+# After this many seconds with no stream event, the live status shows an "⏳ idle"
+# hint (the run is on a long quiet step, e.g. a slow build). Distinct from
+# IDLE_TIMEOUT, which kills the run; this only annotates it.
+IDLE_HINT = float(os.environ.get("IDLE_HINT_SECONDS", "30"))
 
 # A progress callback receives an immutable snapshot of run progress and pushes
 # it to Slack (create/edit a status message). Owned by the daemon; the handler
@@ -333,12 +337,12 @@ def _strip_inline_md(text: str) -> str:
 # Ceiling on action lines in one update. A busy window shows up to this many;
 # anything beyond is summarised as "… and N more". Kept under Slack's ~3000-char
 # section limit by _ACTIONS_CHARS too (whichever bound hits first).
-_ACTIONS_MAX = 100
+_ACTIONS_MAX = 99
 _ACTIONS_CHARS = 2500
 # Max todo lines shown in the live checklist before collapsing the tail.
 _TODOS_MAX = 15
 # Max per-file lines in the changed-files section (Slack "Show more" collapses it).
-_FILES_MAX = 60
+_FILES_MAX = 99
 # Status icon per todo state (no interactive checkboxes in a posted message).
 _TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
 # Context-window sizes (max input tokens) for the "ctx used/window" readout,
@@ -352,6 +356,17 @@ _BUILTIN_MODEL_CONTEXT = {
     "mythos": 1_000_000,
     "opus": 1_000_000,
     "sonnet": 1_000_000,
+}
+
+
+# USD per 1M tokens (input, output) by model substring; fallback when the file
+# has no prices. Cache read ≈ 0.1× input, cache write ≈ 1.25× input.
+_BUILTIN_MODEL_PRICES = {
+    "haiku": (1.0, 5.0),
+    "fable": (10.0, 50.0),
+    "mythos": (10.0, 50.0),
+    "opus": (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
 }
 
 
@@ -369,7 +384,25 @@ def _load_model_context() -> tuple[dict[str, int], int]:
     return dict(_BUILTIN_MODEL_CONTEXT), 200_000
 
 
+def _load_model_prices() -> dict[str, tuple[float, float]]:
+    """Return {substring: (in_price, out_price)} from model_context.json, or built-ins."""
+    try:
+        with open(_MODEL_CONTEXT_CONFIG) as f:
+            cfg = json.load(f)
+        prices = {
+            str(k).lower(): (float(v["in"]), float(v["out"]))
+            for k, v in (cfg.get("prices") or {}).items()
+            if isinstance(v, dict) and "in" in v and "out" in v
+        }
+        if prices:
+            return prices
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        logger.warning("model_context.json prices unusable (%s) — using built-ins.", exc)
+    return dict(_BUILTIN_MODEL_PRICES)
+
+
 _MODEL_CONTEXT, _DEFAULT_CONTEXT = _load_model_context()
+_MODEL_PRICES = _load_model_prices()
 
 
 def _fmt_tokens(n: int) -> str:
@@ -392,6 +425,35 @@ def _model_context(model: str) -> int:
         if key in m:
             return size
     return _DEFAULT_CONTEXT
+
+
+def _model_price(model: str) -> "tuple[float, float] | None":
+    """(input, output) USD per 1M tokens for *model*, or None if unknown."""
+    m = (model or "").lower()
+    for key, price in _MODEL_PRICES.items():
+        if key in m:
+            return price
+    return None
+
+
+def _estimate_cost(model: str, tok_in: int, tok_out: int, cache_r: int, cache_c: int) -> "float | None":
+    """Rough USD cost from token usage; None when the model price is unknown.
+
+    Cache reads bill ~0.1× input, cache writes ~1.25× input.
+    """
+    price = _model_price(model)
+    if price is None:
+        return None
+    pin, pout = price
+    return (tok_in * pin + tok_out * pout + cache_r * pin * 0.1 + cache_c * pin * 1.25) / 1_000_000
+
+
+def _fmt_cost(usd: float) -> str:
+    if usd < 0.01:
+        return "<$0.01"
+    if usd < 1:
+        return f"${usd:.2f}"        # $0.35
+    return f"${usd:.1f}"            # $22.1
 
 
 class _Progress(NamedTuple):
@@ -440,6 +502,7 @@ class _ProgressTracker:
         self._file_removed: dict[str, int] = {}  # per-file removed lines
         self._skills: list[str] = []         # skill names invoked (ordered, unique)
         self._mcp: set[str] = set()          # MCP server names used (mcp__<server>__*)
+        self._compactions = 0                # times context was auto-compacted
         self._errors = 0                     # tool_result blocks flagged is_error
         self._last_error = ""                # first line of the latest error result
         self._tool_counts: dict[str, int] = {}  # per-tool-name use counts
@@ -496,6 +559,9 @@ class _ProgressTracker:
         elif etype == "system":
             if event.get("model"):
                 self._model = event["model"]
+            if event.get("subtype") == "compact_boundary":  # CLI auto-compaction marker
+                self._compactions += 1
+                self._dirty = True
         elif etype == "result":
             nt = event.get("num_turns")
             if isinstance(nt, int) and nt > 0:
@@ -529,6 +595,9 @@ class _ProgressTracker:
         elif btype == "thinking":
             if (block.get("thinking") or "").strip():
                 self._push("🤔 Thinking…")
+        elif btype == "compaction":  # API compaction content block
+            self._compactions += 1
+            self._dirty = True
 
     def _ingest_tool(self, block: dict) -> None:
         name = block.get("name", "") or "Tool"
@@ -617,11 +686,11 @@ class _ProgressTracker:
         return " · ".join(f"{n} {key}" for key, n in ordered[:6])
 
     def _files_block(self) -> str:
-        """Own section: a header + one line per changed file with per-file churn.
+        """Header + a bulleted list of changed files with per-file churn.
 
-        Listed in full (capped at _FILES_MAX) so Slack's own "Show more" collapses
-        a long list. Per-file +/− is churn, not a real diff — Slack has no nested
-        collapsible blocks, so true per-file diffs aren't shown.
+        A plain mrkdwn section (keeps `code`/bold) — a long one gets Slack's own
+        "Show more" collapse. Per-file +/− is churn, not a real diff (Slack has no
+        nested collapsible blocks).
         """
         if not self._files:
             return ""
@@ -651,16 +720,24 @@ class _ProgressTracker:
         return "\n".join(lines)
 
     def _tokens_str(self) -> str:
-        return (
+        s = (
             f"🪙 ↑{_fmt_tokens(self._tok_in)} ↓{_fmt_tokens(self._tok_out)}"
             f" ⚡{_fmt_tokens(self._tok_cache_r)}"
         )
+        cost = _estimate_cost(
+            self._model, self._tok_in, self._tok_out, self._tok_cache_r, self._tok_cache_c
+        )
+        if cost is not None:
+            s += f" ({_fmt_cost(cost)})"   # 🪙 ↑12k ↓4.2k ⚡368k ($22)
+        return s
 
     def _meta(self, elapsed: str) -> str:
         """Muted context block: activity line + resource line."""
         line_a: list[str] = [self._tool_breakdown()]
         if self._subagents:
             line_a.append(f"🤖 {self._subagents} subagent{'s' if self._subagents != 1 else ''}")
+        if self._compactions:
+            line_a.append(f"🗜️ compacted {self._compactions}×")
         if self._errors:
             err = f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}"
             if self._last_error:
@@ -693,13 +770,14 @@ class _ProgressTracker:
             lines.append(" · ".join(line_c))
         return "\n".join(lines)
 
-    def snapshot(self, now: float, *, done: bool = False) -> _Progress:
+    def snapshot(self, now: float, *, done: bool = False, idle: float = 0.0) -> _Progress:
         """Render the current state; clears ``dirty``.
 
         Shows every action that happened in this window (since the last
         snapshot); if fewer than the floor (PROGRESS_ACTIONS) occurred, pads
         with the most recent earlier ones so at least the floor is visible.
-        Always strictly newest-first.
+        Always strictly newest-first. *idle* (seconds since the last stream
+        event) surfaces an "⏳ idle" hint at the top when the run goes quiet.
         """
         self._dirty = False
         elapsed = _fmt_duration(now - self._start)
@@ -718,6 +796,8 @@ class _ProgressTracker:
         lines = list(shown)
         if hidden:
             lines.append(f"… and {hidden} more")
+        if not done and idle >= IDLE_HINT:       # surface a stuck/quiet run
+            lines.insert(0, f"⏳ idle {_fmt_duration(idle)} — still on the current step")
         live = "\n".join(lines) if lines else "🔄 Working…"
         return _Progress(
             live=live, meta=self._meta(elapsed), todos=self._todos_block(),
@@ -1190,9 +1270,15 @@ class ClaudeHandler:
                         )
                         _kill_process_tree(process)
                         return
-                    if progress_cb is not None and tracker.dirty:
+                    idle = now - last_event
+                    # Flush on new activity, OR (once a status msg exists) when the
+                    # run has gone quiet — to show the "⏳ idle" hint and keep
+                    # elapsed ticking on a long silent step.
+                    if progress_cb is not None and (
+                        tracker.dirty or (flushed_once and idle >= IDLE_HINT)
+                    ):
                         try:
-                            await progress_cb(tracker.snapshot(now))
+                            await progress_cb(tracker.snapshot(now, idle=idle))
                             flushed_once = True
                         except Exception as exc:  # noqa: BLE001 — progress is best-effort
                             logger.warning("progress update failed: %s", exc)

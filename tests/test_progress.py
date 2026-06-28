@@ -44,14 +44,14 @@ def test_fmt_duration(seconds, expected):
 
 # --- _ProgressTracker ------------------------------------------------------
 
-def test_tracker_edit_sets_action_file_and_tally():
+def test_tracker_edit_sets_action_in_live_and_tally_in_meta():
     t = _ProgressTracker(start=0.0)
     t.ingest(_assistant(_tool("Edit", file_path="/proj/src/session.py")))
     snap = t.snapshot(now=5.0)
-    assert "✏️ Editing `session.py`" in snap.live
-    assert "1 file" in snap.live
-    assert "1 tool" in snap.live
-    assert "5s" in snap.live
+    assert "✏️ Editing `session.py`" in snap.live   # action line
+    assert "1 file" in snap.meta                      # tally in the muted line
+    assert "1 tool" in snap.meta
+    assert "5s" in snap.meta
 
 
 def test_tracker_counts_unique_files_only():
@@ -60,8 +60,34 @@ def test_tracker_counts_unique_files_only():
     t.ingest(_assistant(_tool("Write", file_path="/a/y.py")))
     t.ingest(_assistant(_tool("Edit", file_path="/a/x.py")))  # repeat
     snap = t.snapshot(now=1.0)
-    assert "2 files" in snap.live  # x.py counted once
-    assert "3 tools" in snap.live
+    assert "2 files" in snap.meta  # x.py counted once
+    assert "3 tools" in snap.meta
+
+
+def test_tracker_shows_last_n_actions_newest_first():
+    t = _ProgressTracker(start=0.0)  # default N=3
+    t.ingest(_assistant(_tool("Read", file_path="/a/one.py")))
+    t.ingest(_assistant(_tool("Edit", file_path="/a/two.py")))
+    t.ingest(_assistant(_tool("Bash", command="pytest")))
+    t.ingest(_assistant(_tool("Read", file_path="/a/four.py")))
+    lines = t.snapshot(now=1.0).live.splitlines()
+    assert len(lines) == 3                       # capped at N
+    assert "four.py" in lines[0]                 # newest on top
+    assert "pytest" in lines[1]
+    assert "two.py" in lines[2]
+    assert all("one.py" not in ln for ln in lines)  # oldest dropped
+
+
+def test_tracker_tracks_line_churn_and_errors():
+    t = _ProgressTracker(start=0.0)
+    t.ingest(_assistant(_tool("Edit", file_path="/a/x.py",
+                              old_string="a\nb\nc", new_string="a\nB")))
+    t.ingest({"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True, "content": "boom"}]}})
+    snap = t.snapshot(now=1.0)
+    assert "+2/−3" in snap.meta          # 2 lines added, 3 removed (churn)
+    assert "⚠️ 1 error" in snap.meta
+    assert "+2/−3" in snap.summary       # also surfaced in the final summary
 
 
 def test_tracker_dirty_lifecycle():
@@ -159,6 +185,18 @@ def test_reporter_live_message_has_stop_button():
     assert btn is not None
     assert btn["value"] == "T1"      # carries the run's thread_ts for stop()
     assert btn["style"] == "danger"
+
+
+def test_reporter_renders_meta_as_context_block():
+    client = _FakeClient()
+    reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
+    asyncio.run(reporter(_Progress(
+        live="✏️ Editing `x.py`", summary="s", done=False, meta="🔄 1 file · 2 tools · 5s",
+    )))
+    blocks = client.posts[0]["blocks"]
+    kinds = [b["type"] for b in blocks]
+    assert kinds == ["section", "context", "actions"]  # action / tally / button
+    assert blocks[1]["elements"][0]["text"] == "🔄 1 file · 2 tools · 5s"
 
 
 def test_reporter_done_snapshot_renders_summary_without_button():

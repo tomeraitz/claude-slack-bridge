@@ -34,6 +34,7 @@ import re
 import session_store
 import signal
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, NamedTuple
 
@@ -48,6 +49,8 @@ IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 min
 # Live progress: aggregate stream events and edit a single Slack status
 # message at most once every PROGRESS_INTERVAL seconds (≤0 falls back to 10).
 PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL_SECONDS", "10"))
+# How many recent actions the live status shows (newest first; ≤0 falls back to 3).
+PROGRESS_ACTIONS = int(os.environ.get("PROGRESS_ACTIONS", "3"))
 
 # A progress callback receives an immutable snapshot of run progress and pushes
 # it to Slack (create/edit a status message). Owned by the daemon; the handler
@@ -266,17 +269,24 @@ def _fmt_duration(seconds: float) -> str:
     return f"{total // 3600}h{(total % 3600) // 60:02d}m"
 
 
+def _count_lines(text: str) -> int:
+    """Line count of *text* (0 for empty). Used for edit churn (+/−)."""
+    return text.count("\n") + 1 if text else 0
+
+
 class _Progress(NamedTuple):
     """An immutable progress snapshot handed to the daemon's ProgressCb.
 
-    ``live`` is the one-line status shown while running; ``summary`` is the
-    collapsed end-state (one headline + an auto-collapsed detail block).
-    ``done`` tells the callback to render ``summary`` instead of ``live``.
+    While running the daemon shows ``live`` (the last N actions, newest first)
+    with ``meta`` rendered as a muted context line below it. ``summary`` is the
+    collapsed end-state (one headline + an auto-collapsed detail block); ``done``
+    tells the callback to render ``summary`` instead.
     """
 
     live: str
     summary: str
     done: bool
+    meta: str = ""
 
 
 class _ProgressTracker:
@@ -285,41 +295,62 @@ class _ProgressTracker:
     Deterministic and side-effect-free (no clock of its own, no I/O): callers
     pass ``now`` so elapsed time is testable. ``dirty`` flags whether anything
     changed since the last ``snapshot`` so the throttle can skip no-op edits.
+    Everything is derived from the events the CLI already emits — no LLM calls.
     """
 
     def __init__(self, start: float) -> None:
         self._start = start
-        self._action = "Working…"
+        n = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 3
+        self._recent: deque[str] = deque(maxlen=n)  # rendered actions, oldest→newest
         self._tool_count = 0
         self._files: list[str] = []          # ordered, unique edited/written paths
         self._file_set: set[str] = set()
         self._reads = 0
         self._commands: list[str] = []       # first line of each Bash command
+        self._added = 0                      # lines added across edits (churn)
+        self._removed = 0                    # lines removed across edits (churn)
+        self._errors = 0                     # tool_result blocks flagged is_error
         self._dirty = False
 
     @property
     def dirty(self) -> bool:
         return self._dirty
 
-    def ingest(self, event: Any) -> None:
-        """Update state from one stream-json event (assistant/tool blocks)."""
-        if not isinstance(event, dict) or event.get("type") != "assistant":
+    def _push(self, action: str) -> None:
+        """Record the newest action, collapsing consecutive duplicates."""
+        if self._recent and self._recent[-1] == action:
             return
-        for block in event.get("message", {}).get("content", []) or []:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "tool_use":
-                self._ingest_tool(block)
-            elif btype == "text":
-                text = (block.get("text") or "").strip()
-                if text:
-                    self._action = "💬 " + text.splitlines()[0][:80]
+        self._recent.append(action)
+        self._dirty = True
+
+    def ingest(self, event: Any) -> None:
+        """Update state from one stream-json event."""
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        if etype == "assistant":
+            for block in event.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict):
+                    self._ingest_assistant_block(block)
+        elif etype == "user":
+            # tool_result blocks ride on user events; count the failed ones.
+            for block in event.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" \
+                        and block.get("is_error"):
+                    self._errors += 1
                     self._dirty = True
-            elif btype == "thinking":
-                if (block.get("thinking") or "").strip():
-                    self._action = "🤔 Thinking…"
-                    self._dirty = True
+
+    def _ingest_assistant_block(self, block: dict) -> None:
+        btype = block.get("type")
+        if btype == "tool_use":
+            self._ingest_tool(block)
+        elif btype == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                self._push("💬 " + text.splitlines()[0][:80])
+        elif btype == "thinking":
+            if (block.get("thinking") or "").strip():
+                self._push("🤔 Thinking…")
 
     def _ingest_tool(self, block: dict) -> None:
         name = block.get("name", "") or "Tool"
@@ -334,6 +365,7 @@ class _ProgressTracker:
                     self._file_set.add(path)
                     self._files.append(path)
                 arg = f"`{os.path.basename(path)}`"
+            self._count_edit_churn(name, inp)
         elif name == "Read":
             self._reads += 1
             path = inp.get("file_path") or ""
@@ -350,23 +382,45 @@ class _ProgressTracker:
         elif name in ("WebFetch", "WebSearch"):
             ref = inp.get("url") or inp.get("query") or ""
             arg = f"`{ref[:50]}`" if ref else ""
-        self._action = f"{emoji} {verb} {arg}".strip()
-        self._dirty = True
+        self._push(f"{emoji} {verb} {arg}".strip())
 
-    def _tally(self) -> list[str]:
+    def _count_edit_churn(self, name: str, inp: dict) -> None:
+        """Approximate +/− line churn from an edit tool's input (no real diff)."""
+        if name == "MultiEdit":
+            for e in inp.get("edits") or []:
+                if isinstance(e, dict):
+                    self._removed += _count_lines(e.get("old_string") or "")
+                    self._added += _count_lines(e.get("new_string") or "")
+        elif name == "Write":
+            self._added += _count_lines(inp.get("content") or "")
+        elif name == "NotebookEdit":
+            self._added += _count_lines(inp.get("new_source") or "")
+        else:  # Edit
+            self._removed += _count_lines(inp.get("old_string") or "")
+            self._added += _count_lines(inp.get("new_string") or "")
+
+    def _tally(self, elapsed: str) -> str:
         parts: list[str] = []
         if self._files:
             parts.append(f"{len(self._files)} file{'s' if len(self._files) != 1 else ''}")
+        if self._added or self._removed:
+            parts.append(f"+{self._added}/−{self._removed}")
         parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
-        return parts
+        if self._errors:
+            parts.append(f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}")
+        parts.append(elapsed)
+        return "🔄 " + " · ".join(parts)
 
     def snapshot(self, now: float, *, done: bool = False) -> _Progress:
         """Render the current state; clears ``dirty``."""
         self._dirty = False
         elapsed = _fmt_duration(now - self._start)
-        live = " · ".join([f"🔄 {self._action}", *self._tally(), elapsed])
-        summary = self._render_summary(elapsed)
-        return _Progress(live=live, summary=summary, done=done)
+        # Newest action on top.
+        live = "\n".join(reversed(self._recent)) if self._recent else "🔄 Working…"
+        return _Progress(
+            live=live, meta=self._tally(elapsed),
+            summary=self._render_summary(elapsed), done=done,
+        )
 
     def _render_summary(self, elapsed: str) -> str:
         head_parts: list[str] = []
@@ -374,7 +428,11 @@ class _ProgressTracker:
             head_parts.append(
                 f"{len(self._files)} file{'s' if len(self._files) != 1 else ''} changed"
             )
+        if self._added or self._removed:
+            head_parts.append(f"+{self._added}/−{self._removed}")
         head_parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
+        if self._errors:
+            head_parts.append(f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}")
         head_parts.append(elapsed)
         head = "✅ Done · " + " · ".join(head_parts)
 

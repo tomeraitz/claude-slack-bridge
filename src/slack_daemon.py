@@ -66,28 +66,38 @@ class _ProgressReporter:
         self._thread_ts = thread_ts
         self._status_ts: str | None = None
 
-    def _blocks(self, text: str, *, with_stop: bool) -> list[dict]:
-        """Status text as a section, plus a 🛑 Stop button while still running."""
+    def _live_blocks(self, progress: Any) -> list[dict]:
+        """Recent actions as a section, a muted tally context line, then 🛑 Stop."""
         blocks: list[dict] = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+            {"type": "section", "text": {"type": "mrkdwn", "text": progress.live}}
         ]
-        if with_stop:
+        if progress.meta:
             blocks.append({
-                "type": "actions",
-                "elements": [{
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "🛑 Stop", "emoji": True},
-                    "style": "danger",
-                    "action_id": _STOP_ACTION_ID,
-                    "value": self._thread_ts,  # what _handle_stop_button stops
-                }],
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": progress.meta}],
             })
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🛑 Stop", "emoji": True},
+                "style": "danger",
+                "action_id": _STOP_ACTION_ID,
+                "value": self._thread_ts,  # what _handle_stop_button stops
+            }],
+        })
         return blocks
 
     async def __call__(self, progress: Any) -> None:
-        text = progress.summary if progress.done else progress.live
-        # Drop the button once the run is done (summary snapshot).
-        blocks = self._blocks(text, with_stop=not progress.done)
+        # Done -> a single summary section (no button). Otherwise the live view.
+        if progress.done:
+            text = progress.summary
+            blocks: list[dict] = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+            ]
+        else:
+            text = progress.live
+            blocks = self._live_blocks(progress)
         if self._status_ts is None:
             resp = await self._client.chat_postMessage(
                 channel=self._channel, thread_ts=self._thread_ts, text=text, blocks=blocks,

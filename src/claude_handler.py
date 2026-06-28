@@ -49,8 +49,9 @@ IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 min
 # Live progress: aggregate stream events and edit a single Slack status
 # message at most once every PROGRESS_INTERVAL seconds (≤0 falls back to 10).
 PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL_SECONDS", "10"))
-# How many recent actions the live status shows (newest first; ≤0 falls back to 3).
-PROGRESS_ACTIONS = int(os.environ.get("PROGRESS_ACTIONS", "3"))
+# Max recent actions the live status shows (rolling, newest first). Beyond this
+# the rest collapse into "… and N more". ≤0 falls back to 99.
+PROGRESS_ACTIONS = int(os.environ.get("PROGRESS_ACTIONS", "99"))
 # After this many seconds with no stream event, the live status shows an "⏳ idle"
 # hint (the run is on a long quiet step, e.g. a slow build). Distinct from
 # IDLE_TIMEOUT, which kills the run; this only annotates it.
@@ -334,10 +335,8 @@ def _strip_inline_md(text: str) -> str:
     return text
 
 
-# Ceiling on action lines in one update. A busy window shows up to this many;
-# anything beyond is summarised as "… and N more". Kept under Slack's ~3000-char
-# section limit by _ACTIONS_CHARS too (whichever bound hits first).
-_ACTIONS_MAX = 99
+# Keep the actions section under Slack's ~3000-char block limit (the PROGRESS_ACTIONS
+# count cap and this char cap both apply, whichever hits first).
 _ACTIONS_CHARS = 2500
 # Max todo lines shown in the live checklist before collapsing the tail.
 _TODOS_MAX = 15
@@ -484,13 +483,10 @@ class _ProgressTracker:
 
     def __init__(self, start: float) -> None:
         self._start = start
-        self._floor = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 3
-        # Full ordered action history (oldest→newest), capped for memory. We keep
-        # the whole window rather than a fixed ring so nothing is silently
-        # skipped between updates and the order is always strictly newest-first.
-        self._actions: deque[str] = deque(maxlen=200)
+        self._cap = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 99
+        # Rolling action history (oldest→newest), retained a bit beyond the cap.
+        self._actions: deque[str] = deque(maxlen=max(200, self._cap + 1))
         self._total = 0                      # actions ever recorded
-        self._shown = 0                      # _total at the previous snapshot
         self._tool_count = 0
         self._files: list[str] = []          # ordered, unique edited/written paths
         self._file_set: set[str] = set()
@@ -773,26 +769,24 @@ class _ProgressTracker:
     def snapshot(self, now: float, *, done: bool = False, idle: float = 0.0) -> _Progress:
         """Render the current state; clears ``dirty``.
 
-        Shows every action that happened in this window (since the last
-        snapshot); if fewer than the floor (PROGRESS_ACTIONS) occurred, pads
-        with the most recent earlier ones so at least the floor is visible.
-        Always strictly newest-first. *idle* (seconds since the last stream
-        event) surfaces an "⏳ idle" hint at the top when the run goes quiet.
+        Shows the most recent actions (up to PROGRESS_ACTIONS), newest first;
+        anything older collapses into "… and N more". *idle* (seconds since the
+        last stream event) surfaces an "⏳ idle" hint at the top when quiet.
         """
         self._dirty = False
         elapsed = _fmt_duration(now - self._start)
-        window = self._total - self._shown
-        self._shown = self._total
-        want = max(window, self._floor)          # floor when the window was quiet
         candidates = list(reversed(self._actions))  # newest first
         shown: list[str] = []
         used = 0
-        for line in candidates[:min(want, _ACTIONS_MAX)]:
-            if shown and used + len(line) + 1 > _ACTIONS_CHARS:
+        # Number actions by their position in the whole run (newest = highest), so
+        # the count is visible and new actions clearly append at the top.
+        for k, line in enumerate(candidates[:self._cap]):
+            numbered = f"`{self._total - k}.` {line}"
+            if shown and used + len(numbered) + 1 > _ACTIONS_CHARS:
                 break                            # keep the section under Slack's limit
-            shown.append(line)
-            used += len(line) + 1
-        hidden = max(0, window - len(shown))     # everything from this window we didn't show
+            shown.append(numbered)
+            used += len(numbered) + 1
+        hidden = max(0, self._total - len(shown))   # everything not shown
         lines = list(shown)
         if hidden:
             lines.append(f"… and {hidden} more")
@@ -805,6 +799,8 @@ class _ProgressTracker:
         )
 
     def _render_summary(self, elapsed: str) -> str:
+        """One-line "✅ Done" headline. The full detail stays in the live sections,
+        which the daemon keeps below this headline on completion (not collapsed)."""
         head_parts: list[str] = []
         if self._files:
             head_parts.append(
@@ -816,39 +812,7 @@ class _ProgressTracker:
         if self._errors:
             head_parts.append(f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}")
         head_parts.append(elapsed)
-        head = "✅ Done · " + " · ".join(head_parts)
-
-        detail: list[str] = []
-        if self._files:
-            names = [os.path.basename(p) for p in self._files]
-            shown = ", ".join(names[:15])
-            if len(names) > 15:
-                shown += f", +{len(names) - 15} more"
-            detail.append(f"Changed: {shown}")
-        if self._reads:
-            detail.append(f"Read {self._reads} file{'s' if self._reads != 1 else ''}")
-        if self._commands:
-            cmds = "; ".join(c[:40] for c in self._commands[:5])
-            if len(self._commands) > 5:
-                cmds += f"; +{len(self._commands) - 5} more"
-            detail.append(f"Ran: {cmds}")
-        if self._subagents:
-            detail.append(f"Subagents: {self._subagents}")
-        if self._tool_counts:
-            detail.append(f"Tools: {self._tool_breakdown()}")
-        if self._tok_out or self._tok_in:
-            detail.append(f"Tokens: {self._tokens_str()}")
-        resources = []
-        if self._turns:
-            resources.append(f"{self._turns} turns")
-        if self._model:
-            resources.append(_short_model(self._model))
-        if resources:
-            detail.append(" · ".join(resources))
-        if not detail:
-            return head
-        # Fenced block -> Slack auto-collapses it behind "Show more" when long.
-        return head + "\n```\n" + "\n".join(detail) + "\n```"
+        return "✅ Done · " + " · ".join(head_parts)
 
 
 class ClaudeHandler:
@@ -1271,12 +1235,12 @@ class ClaudeHandler:
                         _kill_process_tree(process)
                         return
                     idle = now - last_event
-                    # Flush on new activity, OR (once a status msg exists) when the
-                    # run has gone quiet — to show the "⏳ idle" hint and keep
-                    # elapsed ticking on a long silent step.
-                    if progress_cb is not None and (
-                        tracker.dirty or (flushed_once and idle >= IDLE_HINT)
-                    ):
+                    # Flush every tick once we've been running ≥1 interval, so the
+                    # status appears at the first tick (~PROGRESS_INTERVAL) even if
+                    # the model is still on a long initial think — not only after
+                    # the first event. Runs that finish before the first tick stay
+                    # silent (no tick fired). Keeps elapsed/idle ticking too.
+                    if progress_cb is not None:
                         try:
                             await progress_cb(tracker.snapshot(now, idle=idle))
                             flushed_once = True

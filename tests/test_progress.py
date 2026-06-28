@@ -78,9 +78,10 @@ def test_tracker_files_block_shows_per_file_churn():
     assert "`y.py`  +3/−0" in files   # Write counts content lines as additions
 
 
-def test_window_shows_all_actions_when_busy():
-    # >floor actions in a single window -> show them all, newest first.
-    t = _ProgressTracker(start=0.0)  # floor=3
+def test_actions_show_rolling_history_newest_first():
+    # All actions so far are shown (under the cap), newest first — not just the
+    # current update window.
+    t = _ProgressTracker(start=0.0)
     for f in ("one", "two", "three", "four", "five"):
         t.ingest(_assistant(_tool("Read", file_path=f"/a/{f}.py")))
     lines = t.snapshot(now=1.0).live.splitlines()
@@ -89,19 +90,28 @@ def test_window_shows_all_actions_when_busy():
     assert "one.py" in lines[-1]    # oldest at the bottom
 
 
-def test_window_pads_to_floor_when_quiet():
-    # A later window with a single new action still shows the floor (3),
-    # newest first, padded with the most recent earlier actions.
+def test_actions_persist_across_snapshots():
+    # A later snapshot still shows the earlier actions (rolling history),
+    # not just what happened since the previous snapshot.
     t = _ProgressTracker(start=0.0)
     for f in ("one", "two", "three", "four", "five"):
         t.ingest(_assistant(_tool("Read", file_path=f"/a/{f}.py")))
-    t.snapshot(now=1.0)  # window 1 consumes the five
+    t.snapshot(now=1.0)  # first update
     t.ingest(_assistant(_tool("Read", file_path="/a/six.py")))
     lines = t.snapshot(now=2.0).live.splitlines()
-    assert len(lines) == 3
-    assert "six.py" in lines[0]     # newest on top
-    assert "five.py" in lines[1]    # then the previous ones, in order
-    assert "four.py" in lines[2]
+    assert len(lines) == 6           # all six, not just the one new action
+    assert "six.py" in lines[0]      # newest on top
+    assert "one.py" in lines[-1]
+
+
+def test_actions_are_numbered_highest_on_top():
+    t = _ProgressTracker(start=0.0)
+    for f in ("a", "b", "c"):
+        t.ingest(_assistant(_tool("Read", file_path=f"/a/{f}.py")))
+    lines = t.snapshot(now=1.0).live.splitlines()
+    assert lines[0].startswith("`3.`") and "c.py" in lines[0]   # newest = highest number
+    assert lines[1].startswith("`2.`")
+    assert lines[2].startswith("`1.`") and "a.py" in lines[2]
 
 
 def test_long_narration_is_clipped_with_ellipsis():
@@ -109,7 +119,7 @@ def test_long_narration_is_clipped_with_ellipsis():
     long = "Now it's clear and I owe you a correction so " * 12  # > 400 chars
     t.ingest(_assistant(_text(long)))
     line = t.snapshot(now=1.0).live.splitlines()[0]
-    assert line.startswith("💬 ")
+    assert "💬 " in line             # numbered prefix then the narration
     assert line.endswith("…")        # clearly truncated, not cut mid-word silently
     assert not line.endswith(" …")   # trimmed on a word boundary
 
@@ -180,14 +190,18 @@ def test_tracker_tracks_skills_and_mcp_servers():
     assert "2 mcp" in meta                            # both mcp tools grouped in the breakdown
 
 
-def test_window_caps_actions_and_counts_the_rest():
+def test_actions_cap_and_count_the_rest():
     t = _ProgressTracker(start=0.0)
     for i in range(130):
         t.ingest(_assistant(_tool("Read", file_path=f"/a/f{i}.py")))
     lines = t.snapshot(now=1.0).live.splitlines()
-    assert len(lines) == 100                        # 99 actions + the overflow line
-    assert lines[-1] == "… and 31 more"             # 130 - 99 shown
-    assert "f129.py" in lines[0]                     # newest still on top
+    assert lines[-1].startswith("… and ")           # overflow line at the bottom
+    assert "f129.py" in lines[0]                     # newest on top
+    assert lines[0].startswith("`130.`")            # numbered: highest on top
+    shown = len(lines) - 1                           # excl. overflow line
+    assert shown <= 99                               # bounded by the count cap
+    hidden = int(lines[-1].split("… and ")[1].split(" ")[0])
+    assert shown + hidden == 130                     # nothing lost in the count
 
 
 def test_tracker_counts_compactions():
@@ -265,18 +279,18 @@ def test_tracker_text_and_thinking_update_action():
     assert "second line" not in live  # only the first line is shown
 
 
-def test_tracker_summary_lists_changes_reads_and_commands():
+def test_tracker_summary_is_one_line_headline_detail_kept_in_sections():
     t = _ProgressTracker(start=0.0)
     t.ingest(_assistant(_tool("Edit", file_path="/a/session.py")))
     t.ingest(_assistant(_tool("Read", file_path="/a/config.py")))
     t.ingest(_assistant(_tool("Bash", command="pytest -q\necho done")))
     snap = t.snapshot(now=134.0, done=True)
     assert snap.done is True
-    assert snap.summary.startswith("✅ Done · 1 file changed · 3 tools · 2m14s")
-    assert "Changed: session.py" in snap.summary
-    assert "Read 1 file" in snap.summary
-    assert "Ran: pytest -q" in snap.summary  # only first line of the command
-    assert "```" in snap.summary             # detail block is fenced (auto-collapses)
+    assert snap.summary == "✅ Done · 1 file changed · 3 tools · 2m14s"  # one-line headline
+    assert "```" not in snap.summary          # no collapsed detail block now
+    # Detail lives in the kept sections instead:
+    assert "session.py" in snap.files
+    assert "1 read · 1 edit · 1 bash" in snap.meta or "1 bash" in snap.meta
 
 
 def test_tracker_summary_no_detail_block_when_nothing_tracked():

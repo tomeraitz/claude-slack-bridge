@@ -109,12 +109,13 @@ class _ProgressReporter:
         return blocks
 
     async def __call__(self, progress: Any) -> None:
-        # Done -> a single summary section. Otherwise the live action view.
+        # Done -> "✅ Done" headline on top, then the FULL live view kept below
+        # (todos, actions, files, grey resources) — not collapsed to one line.
         if progress.done:
             text = progress.summary
-            blocks: list[dict] = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": text}}
-            ]
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": progress.summary}}
+            ] + self._live_blocks(progress)
         else:
             text = progress.live
             blocks = self._live_blocks(progress)

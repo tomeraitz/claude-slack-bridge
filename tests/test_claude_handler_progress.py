@@ -122,8 +122,8 @@ def test_streaming_run_returns_result_and_drives_progress(tmp_path, monkeypatch)
     assert reply == "All done!"
     assert snaps, "progress_cb should have been called at least once"
     assert snaps[-1].done is True                      # final summary snapshot
-    assert "✅ Done" in snaps[-1].summary
-    assert "session.py" in snaps[-1].summary
+    assert "✅ Done" in snaps[-1].summary              # one-line headline
+    assert "session.py" in snaps[-1].files             # detail kept in the files section
 
 
 def test_idle_run_is_killed_and_returns_timeout_reply(tmp_path, monkeypatch):

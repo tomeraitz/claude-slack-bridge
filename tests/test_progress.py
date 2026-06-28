@@ -121,9 +121,28 @@ def test_tracker_tokens_turns_model_and_ctx():
         {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/x.py"}}]}})
     meta = t.snapshot(now=1.0).meta
     assert "🪙 ↑1k ↓500 ⚡99k" in meta       # in / out / cache tokens
-    assert "ctx 50%" in meta                  # (1000+99000)/200000
+    assert "ctx 10%" in meta                  # (1000+99000)/1_000_000 — Opus is 1M
     assert "1 turn" in meta
     assert "opus-4-8" in meta                 # model, claude- stripped
+
+
+def test_tracker_ctx_pct_uses_per_model_window():
+    # Haiku 4.5 is 200K, not 1M — same prompt size reads as a higher %.
+    t = _ProgressTracker(start=0.0)
+    t.ingest({"type": "system", "subtype": "init", "model": "claude-haiku-4-5"})
+    t.ingest({"type": "assistant", "message": {"usage": {
+        "input_tokens": 100_000, "output_tokens": 1}, "content": []}})
+    assert "ctx 50%" in t.snapshot(now=1.0).meta   # 100000/200000
+
+
+def test_window_caps_actions_and_counts_the_rest():
+    t = _ProgressTracker(start=0.0)
+    for i in range(130):
+        t.ingest(_assistant(_tool("Read", file_path=f"/a/f{i}.py")))
+    lines = t.snapshot(now=1.0).live.splitlines()
+    assert len(lines) == 101                       # 100 actions + the overflow line
+    assert lines[-1] == "… and 30 more"            # 130 - 100 shown
+    assert "f129.py" in lines[0]                    # newest still on top
 
 
 def test_tracker_tool_breakdown_and_subagents():

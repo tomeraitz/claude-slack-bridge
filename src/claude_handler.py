@@ -314,16 +314,26 @@ def _strip_inline_md(text: str) -> str:
     return text
 
 
-# Hard ceiling on action lines in one update, so a very busy window can't blow
-# past Slack's block size. Anything beyond is summarised as "…+N earlier".
-_ACTIONS_MAX = 30
+# Ceiling on action lines in one update. A busy window shows up to this many;
+# anything beyond is summarised as "… and N more". Kept under Slack's ~3000-char
+# section limit by _ACTIONS_CHARS too (whichever bound hits first).
+_ACTIONS_MAX = 100
+_ACTIONS_CHARS = 2500
 # Max todo lines shown in the live checklist before collapsing the tail.
 _TODOS_MAX = 15
 # Status icon per todo state (no interactive checkboxes in a posted message).
 _TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
-# Approx context-window sizes for the "ctx %" readout, keyed by model substring.
-_MODEL_CONTEXT = {"opus": 200_000, "sonnet": 200_000, "haiku": 200_000}
-_DEFAULT_CONTEXT = 200_000
+# Context-window sizes (max input tokens) for the "ctx %" readout, keyed by
+# model substring, per the Claude API model catalog. Current models: Opus
+# 4.6/4.7/4.8, Sonnet 4.6, Fable 5, Mythos 5 are 1M; Haiku 4.5 is 200K.
+_MODEL_CONTEXT = {
+    "haiku": 200_000,      # checked before the 1M families below
+    "fable": 1_000_000,
+    "mythos": 1_000_000,
+    "opus": 1_000_000,
+    "sonnet": 1_000_000,
+}
+_DEFAULT_CONTEXT = 200_000  # conservative fallback for older / unknown models
 
 
 def _fmt_tokens(n: int) -> str:
@@ -619,13 +629,19 @@ class _ProgressTracker:
         elapsed = _fmt_duration(now - self._start)
         window = self._total - self._shown
         self._shown = self._total
-        count = max(window, self._floor)
-        overflow = max(0, count - _ACTIONS_MAX)
-        count = min(count, _ACTIONS_MAX, len(self._actions))
-        recent = list(self._actions)[-count:] if count else []
-        lines = list(reversed(recent))  # newest on top
-        if overflow:
-            lines.append(f"…+{overflow} earlier")
+        want = max(window, self._floor)          # floor when the window was quiet
+        candidates = list(reversed(self._actions))  # newest first
+        shown: list[str] = []
+        used = 0
+        for line in candidates[:min(want, _ACTIONS_MAX)]:
+            if shown and used + len(line) + 1 > _ACTIONS_CHARS:
+                break                            # keep the section under Slack's limit
+            shown.append(line)
+            used += len(line) + 1
+        hidden = max(0, window - len(shown))     # everything from this window we didn't show
+        lines = list(shown)
+        if hidden:
+            lines.append(f"… and {hidden} more")
         live = "\n".join(lines) if lines else "🔄 Working…"
         files_line = self._files_line()
         if files_line:  # files shown unmuted, in the main section

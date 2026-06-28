@@ -274,47 +274,56 @@ class TestLiveProgressToggle:
         assert d._make_reporter("C1", "T1", "T1") is None
 
 
-class TestStopButton:
-    def _body(self, value="thread.1", channel="C1"):
-        return {
-            "actions": [{"action_id": "stop_run", "value": value}],
-            "channel": {"id": channel},
-            "user": {"id": "U_human"},
-        }
-
-    def test_button_stops_run_and_posts_notice(self, monkeypatch):
+class TestStatusReactionStop:
+    def test_status_post_wires_reaction_and_drops_trigger(self, monkeypatch):
+        import slack_daemon as sd
         d = make_daemon(monkeypatch)
-        acked = []
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", True)
+        reporter = d._make_reporter("C1", "thread.1", "trig.1")
+
+        # Simulate the reporter's first post invoking its on_status_posted hook.
+        asyncio.run(reporter._on_status_posted("status.9"))
+
+        # Reacting 🛑 on the status message now resolves to the run...
+        assert d._trigger_to_thread["status.9"] == "thread.1"
+        # ...the bot put 🛑 on the status message...
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "status.9"} \
+            in d._app.client.added
+        # ...and removed the now-redundant trigger-message reaction.
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "trig.1"} \
+            in d._app.client.removed
+
+    def test_reaction_on_status_message_stops_run(self, monkeypatch):
+        d = make_daemon(monkeypatch)
+        d._bot_user_id = "U_bot"
+        d._trigger_to_thread["status.9"] = "thread.1"  # as wired when status posted
         stopped = []
 
-        async def fake_ack():
-            acked.append(True)
-
-        async def fake_stop(thread_ts):
-            stopped.append(thread_ts)
+        async def fake_stop(t):
+            stopped.append(t)
             return True
 
         monkeypatch.setattr(d._claude, "stop", fake_stop)
+        ev = {"reaction": "octagonal_sign", "user": "U_human",
+              "item": {"channel": "C1", "ts": "status.9"}}
 
-        asyncio.run(d._handle_stop_button(fake_ack, self._body()))
+        asyncio.run(d._handle_reaction_added(ev))
 
-        assert acked == [True]          # acked within Slack's 3s window
-        assert stopped == ["thread.1"]  # value -> stop(thread_ts)
+        assert stopped == ["thread.1"]
         assert d._app.client.posted == [
             {"channel": "C1", "thread_ts": "thread.1", "text": "⏹️ Stopped."}
         ]
 
-    def test_button_noop_when_nothing_in_flight(self, monkeypatch):
+    def test_unwind_clears_mapping_and_reaction_when_message_present(self, monkeypatch):
+        import slack_daemon as sd
         d = make_daemon(monkeypatch)
+        reporter = sd._ProgressReporter(d._app.client, "C1", "thread.1")
+        reporter.posted_ts = "status.9"
+        reporter._status_ts = "status.9"  # still present (finished as summary)
+        d._trigger_to_thread["status.9"] = "thread.1"
 
-        async def fake_ack():
-            pass
+        asyncio.run(d._unwind_status_stop("C1", reporter))
 
-        async def fake_stop(thread_ts):
-            return False  # already finished
-
-        monkeypatch.setattr(d._claude, "stop", fake_stop)
-
-        asyncio.run(d._handle_stop_button(fake_ack, self._body()))
-
-        assert d._app.client.posted == []  # no stop notice when nothing was killed
+        assert "status.9" not in d._trigger_to_thread
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "status.9"} \
+            in d._app.client.removed

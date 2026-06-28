@@ -37,16 +37,11 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 
-# action_id of the 🛑 Stop button on the live status message. Clicking it routes
-# to _handle_stop_button (delivered over Socket Mode — requires Interactivity to
-# be enabled in the Slack app; no request URL is needed). The 🛑 *reaction* on
-# the trigger message remains as a no-config fallback.
-_STOP_ACTION_ID = "stop_run"
-
-# LIVE_PROGRESS on (default): post a live-updating status message with an inline
-# 🛑 Stop button; the trigger-message 🛑 reaction is removed once that message
-# appears (it only covers the pre-message window). Off: no status message — stop
-# stays the 🛑 reaction on the trigger message for the whole run (old behaviour).
+# LIVE_PROGRESS on (default): post a live-updating status message; the bot adds a
+# 🛑 reaction to that message (clicking it stops the run, same as the trigger
+# reaction) and removes the now-redundant reaction from the trigger message. Off:
+# no status message — stop stays the 🛑 reaction on the trigger message for the
+# whole run (old behaviour). Reactions need no Slack Interactivity config.
 LIVE_PROGRESS = os.environ.get("LIVE_PROGRESS", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
@@ -66,6 +61,11 @@ class _ProgressReporter:
     creates the message; later snapshots edit it in place — no new posts, so no
     thread spam. A ``done`` snapshot collapses it into the summary. On stop or
     error the daemon calls :meth:`delete` so only the final reply remains.
+
+    Stopping is a 🛑 *reaction* on this message (added by the daemon via the
+    ``on_status_posted`` hook), not an inline button — so no Slack Interactivity
+    is required. ``posted_ts`` persists after :meth:`delete` so the daemon can
+    unwind that reaction mapping; ``present`` says whether the message still exists.
     """
 
     def __init__(
@@ -75,13 +75,19 @@ class _ProgressReporter:
         self._client = client
         self._channel = channel
         self._thread_ts = thread_ts
-        # Called once, right after the status message first appears, so the
-        # daemon can drop the now-redundant 🛑 reaction from the trigger message.
+        # Called once with the status message ts the first time it appears, so the
+        # daemon can wire 🛑-reaction stopping onto it and drop the trigger one.
         self._on_status_posted = on_status_posted
         self._status_ts: str | None = None
+        self.posted_ts: str | None = None  # set on first post; kept after delete
+
+    @property
+    def present(self) -> bool:
+        """True while the status message still exists (not deleted)."""
+        return self._status_ts is not None
 
     def _live_blocks(self, progress: Any) -> list[dict]:
-        """Recent actions as a section, a muted tally context line, then 🛑 Stop."""
+        """Recent actions as a section + a muted tally context line."""
         blocks: list[dict] = [
             {"type": "section", "text": {"type": "mrkdwn", "text": progress.live}}
         ]
@@ -90,21 +96,10 @@ class _ProgressReporter:
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": progress.meta}],
             })
-        blocks.append({
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                # Icon-only, matching the 🛑 reaction used elsewhere to stop a run.
-                "text": {"type": "plain_text", "text": "🛑", "emoji": True},
-                "style": "danger",
-                "action_id": _STOP_ACTION_ID,
-                "value": self._thread_ts,  # what _handle_stop_button stops
-            }],
-        })
         return blocks
 
     async def __call__(self, progress: Any) -> None:
-        # Done -> a single summary section (no button). Otherwise the live view.
+        # Done -> a single summary section. Otherwise the live action view.
         if progress.done:
             text = progress.summary
             blocks: list[dict] = [
@@ -118,9 +113,10 @@ class _ProgressReporter:
                 channel=self._channel, thread_ts=self._thread_ts, text=text, blocks=blocks,
             )
             self._status_ts = resp["ts"]
+            self.posted_ts = resp["ts"]
             if self._on_status_posted is not None:
                 try:
-                    await self._on_status_posted()
+                    await self._on_status_posted(self.posted_ts)
                 except Exception as exc:  # noqa: BLE001 — best-effort cleanup
                     logger.warning("on_status_posted hook failed: %s", exc)
         else:
@@ -168,7 +164,6 @@ class SlackDaemon:
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
         self._app.event("reaction_added")(self._handle_reaction_added)
-        self._app.action(_STOP_ACTION_ID)(self._handle_stop_button)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -258,7 +253,11 @@ class SlackDaemon:
         await self._handle_slack_message(event)
 
     async def _handle_reaction_added(self, event: dict[str, Any]) -> None:
-        """Stop a running Flow-B agent when a non-bot user reacts 🛑 to its trigger."""
+        """Stop a running Flow-B agent when a non-bot user reacts 🛑 to it.
+
+        Works for the 🛑 on the trigger message and the one the bot puts on the
+        live status message — both ts values map to the run in _trigger_to_thread.
+        """
         if event.get("reaction") != "octagonal_sign":
             return
         if event.get("user") == self._bot_user_id:
@@ -282,30 +281,6 @@ class SlackDaemon:
         except Exception as exc:
             logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
 
-    async def _handle_stop_button(self, ack, body: dict) -> None:
-        """Stop a run when the 🛑 Stop button on its status message is clicked.
-
-        Mirrors the 🛑-reaction path: the button's ``value`` carries the run's
-        thread_ts, so we kill that run and post the stop notice. The run task
-        then deletes its (button-bearing) status message via the reporter.
-        """
-        await ack()  # acknowledge within Slack's 3s window before doing work
-        actions = body.get("actions") or []
-        thread_ts = actions[0].get("value") if actions else None
-        if not thread_ts:
-            return
-        channel = (body.get("channel") or {}).get("id", "")
-        killed = await self._claude.stop(thread_ts)
-        if not killed:
-            return  # nothing in flight (already finished / stopped)
-
-        try:
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text="⏹️ Stopped."
-            )
-        except Exception as exc:
-            logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
-
     def _make_reporter(
         self, channel: str, thread_ts: str, trigger_ts: str
     ) -> "_ProgressReporter | None":
@@ -313,14 +288,26 @@ class SlackDaemon:
         if not LIVE_PROGRESS:
             return None
 
-        async def _drop_trigger_reaction() -> None:
-            # Status message (with its own 🛑 button) is up — the trigger
-            # reaction is now redundant, so remove it.
+        async def _on_status_posted(status_ts: str) -> None:
+            # Move 🛑-reaction stopping onto the status message: reacting 🛑 on it
+            # resolves to this run, and the now-redundant trigger reaction is dropped.
+            self._trigger_to_thread[status_ts] = thread_ts
+            await self._add_stop_reaction(channel, status_ts)
             await self._remove_stop_reaction(channel, trigger_ts)
 
         return _ProgressReporter(
-            self._app.client, channel, thread_ts, on_status_posted=_drop_trigger_reaction,
+            self._app.client, channel, thread_ts, on_status_posted=_on_status_posted,
         )
+
+    async def _unwind_status_stop(
+        self, channel: str, reporter: "_ProgressReporter | None"
+    ) -> None:
+        """At run end, unwire status-message stopping and tidy its 🛑 reaction."""
+        if reporter is None or reporter.posted_ts is None:
+            return
+        self._trigger_to_thread.pop(reporter.posted_ts, None)
+        if reporter.present:  # message survives as the summary -> remove the 🛑
+            await self._remove_stop_reaction(channel, reporter.posted_ts)
 
     async def _handle_claude_new_message(
         self, channel: str, message_ts: str, text: str, trigger_ts: str,
@@ -357,6 +344,7 @@ class SlackDaemon:
             # later run on this thread_ts is not silently suppressed.
             self._claude._stopped.discard(message_ts)
             await self._remove_stop_reaction(channel, trigger_ts)
+            await self._unwind_status_stop(channel, reporter)
             self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(message_ts)
 
@@ -393,6 +381,7 @@ class SlackDaemon:
             # later run on this thread_ts is not silently suppressed.
             self._claude._stopped.discard(thread_ts)
             await self._remove_stop_reaction(channel, trigger_ts)
+            await self._unwind_status_stop(channel, reporter)
             self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(thread_ts)
 

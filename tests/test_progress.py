@@ -92,7 +92,7 @@ def test_window_pads_to_floor_when_quiet():
 
 def test_long_narration_is_clipped_with_ellipsis():
     t = _ProgressTracker(start=0.0)
-    long = "Now it's clear and I owe you a correction so " * 8
+    long = "Now it's clear and I owe you a correction so " * 12  # > 400 chars
     t.ingest(_assistant(_text(long)))
     line = t.snapshot(now=1.0).live.splitlines()[0]
     assert line.startswith("💬 ")
@@ -174,14 +174,8 @@ class _FakeClient:
         self.deletes.append(kwargs)
 
 
-def _stop_button(blocks):
-    """Return the stop button element in *blocks*, or None."""
-    for b in blocks:
-        if b.get("type") == "actions":
-            for el in b["elements"]:
-                if el.get("action_id") == "stop_run":
-                    return el
-    return None
+def _has_actions(blocks):
+    return any(b.get("type") == "actions" for b in blocks)
 
 
 def test_reporter_creates_then_edits_one_message():
@@ -199,28 +193,26 @@ def test_reporter_creates_then_edits_one_message():
     assert client.updates[0]["ts"] == "1700000000.0001"
 
 
-def test_reporter_live_message_has_stop_button():
+def test_reporter_live_message_has_no_button():
+    # Stop is a 🛑 reaction the daemon adds, not an inline button.
     client = _FakeClient()
     reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
     asyncio.run(reporter(_Progress(live="🔄 working", summary="s", done=False)))
-    btn = _stop_button(client.posts[0]["blocks"])
-    assert btn is not None
-    assert btn["value"] == "T1"      # carries the run's thread_ts for stop()
-    assert btn["style"] == "danger"
-    assert btn["text"]["text"] == "🛑"  # icon-only, like the reaction
+    assert not _has_actions(client.posts[0]["blocks"])
 
 
-def test_reporter_calls_on_status_posted_once():
+def test_reporter_calls_on_status_posted_with_ts_once():
     client = _FakeClient()
     hits = []
 
-    async def hook():
-        hits.append(True)
+    async def hook(status_ts):
+        hits.append(status_ts)
 
     reporter = _ProgressReporter(client, channel="C1", thread_ts="T1", on_status_posted=hook)
     asyncio.run(reporter(_Progress(live="x", summary="s", done=False)))
     asyncio.run(reporter(_Progress(live="y", summary="s", done=False)))
-    assert hits == [True]  # fired only when the message first appears
+    assert hits == ["1700000000.0001"]          # fired once, with the message ts
+    assert reporter.posted_ts == "1700000000.0001"
 
 
 def test_reporter_renders_meta_as_context_block():
@@ -231,17 +223,18 @@ def test_reporter_renders_meta_as_context_block():
     )))
     blocks = client.posts[0]["blocks"]
     kinds = [b["type"] for b in blocks]
-    assert kinds == ["section", "context", "actions"]  # action / tally / button
+    assert kinds == ["section", "context"]   # action lines + muted tally, no button
     assert blocks[1]["elements"][0]["text"] == "🔄 1 file · 2 tools · 5s"
 
 
-def test_reporter_done_snapshot_renders_summary_without_button():
+def test_reporter_done_snapshot_renders_summary():
     client = _FakeClient()
     reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
     asyncio.run(reporter(_Progress(live="🔄 working", summary="✅ done", done=False)))
     asyncio.run(reporter(_Progress(live="🔄 working", summary="✅ done", done=True)))
     assert client.updates[-1]["text"] == "✅ done"       # summary, not live
-    assert _stop_button(client.updates[-1]["blocks"]) is None  # button gone when done
+    assert not _has_actions(client.updates[-1]["blocks"])
+    assert reporter.posted_ts == "1700000000.0001"  # kept for reaction cleanup
 
 
 def test_reporter_delete_removes_posted_message():

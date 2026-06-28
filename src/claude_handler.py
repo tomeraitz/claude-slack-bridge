@@ -390,7 +390,7 @@ class _ProgressTracker:
         elif btype == "text":
             text = (block.get("text") or "").strip()
             if text:
-                self._push("💬 " + _clip(_strip_inline_md(text.splitlines()[0]), 160))
+                self._push("💬 " + _clip(_strip_inline_md(text.splitlines()[0]), 400))
         elif btype == "thinking":
             if (block.get("thinking") or "").strip():
                 self._push("🤔 Thinking…")

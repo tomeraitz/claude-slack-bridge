@@ -18,7 +18,7 @@ Slack @bot   ──────────────────▶  claude -
 - **`ask_on_slack` MCP tool** — Claude pauses mid-task, posts a question to Slack, blocks until you reply in the thread, then resumes. Multiple concurrent sessions are routed correctly by `thread_ts`.
 - **Project-aware Slack bot** — `@claude-bot` in a Slack channel spawns `claude -p` in the matching project directory inside the container. Supports git worktrees via a `[label]` prefix.
 - **Live progress, no timeout** — a run has no wall-clock limit; it works until it finishes or you stop it. While it runs, the bot edits one status message in the thread showing what it's doing (current action + files-changed/tool tally), derived from the CLI's event stream with no extra model calls, then collapses it to a one-line summary. A stuck run (no activity for `IDLE_TIMEOUT_SECONDS`) is killed automatically.
-- **Stop a running task** — react with 🛑 to the message that started a run and the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply.
+- **Stop a running task** — click the 🛑 Stop button on the live status message, or react with 🛑 to the message that started the run. Either way the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply. (The button needs **Interactivity** enabled in your Slack app — no request URL, Socket Mode delivers it. The 🛑 reaction works with no extra config.)
 - **Full-process plugin** — a turnkey feature-development workflow driven from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
 
 ---
@@ -119,9 +119,12 @@ The bot replies in a thread. Continue the conversation by replying in that threa
 
 ### Stopping a running task
 
-When the bot starts working, it adds a 🛑 reaction to the message that triggered the run. **Click that 🛑 reaction to stop the run** — the bot kills the task (and any subprocesses it spawned), posts `⏹️ Stopped.` in the thread, and discards the partial reply. The reaction is removed automatically once the run ends (whether you stopped it or it finished on its own).
+There are two ways to stop a run, both with the same effect — the bot kills the task (and any subprocesses it spawned), posts `⏹️ Stopped.` in the thread, and discards the partial reply:
 
-> Requires the `reactions:read` / `reactions:write` scopes and the `reaction_added` event from [docs/slack-setup.md](docs/slack-setup.md). If you set up the app before this feature existed, add them and reinstall the app.
+- **🛑 Stop button** — the live status message carries a red **🛑 Stop** button while the run is in flight. Clicking it stops the run.
+- **🛑 reaction** — the bot also adds a 🛑 reaction to the message that triggered the run; clicking that reaction stops it too. The reaction is removed automatically once the run ends.
+
+> The reaction path requires the `reactions:read` / `reactions:write` scopes and the `reaction_added` event from [docs/slack-setup.md](docs/slack-setup.md). The button additionally requires **Interactivity** to be turned on in the Slack app (Socket Mode delivers button clicks — no request URL needed). If you set up the app before these features existed, add them and reinstall the app.
 
 → Full reference (channel formats, `plugin_dir`, worktrees, routing rules): **[docs/slack-to-claude-projects.md](docs/slack-to-claude-projects.md)**
 

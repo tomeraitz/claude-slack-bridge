@@ -40,6 +40,11 @@ def make_daemon(monkeypatch) -> SlackDaemon:
                 return fn
             return _wrap
 
+        def action(self, _action_id):  # block_actions registration is a no-op
+            def _wrap(fn):
+                return fn
+            return _wrap
+
     monkeypatch.setattr(sd, "AsyncApp", _FakeApp)
     monkeypatch.setattr(sd, "AsyncSocketModeHandler", lambda *a, **k: object())
     return SlackDaemon(bot_token="xoxb-test", app_token="xapp-test")
@@ -253,3 +258,49 @@ class TestStoppedSuppression:
 
         assert posted == []  # reply suppressed
         assert "100.1" not in d._claude._stopped  # flag cleared for next run
+
+
+class TestStopButton:
+    def _body(self, value="thread.1", channel="C1"):
+        return {
+            "actions": [{"action_id": "stop_run", "value": value}],
+            "channel": {"id": channel},
+            "user": {"id": "U_human"},
+        }
+
+    def test_button_stops_run_and_posts_notice(self, monkeypatch):
+        d = make_daemon(monkeypatch)
+        acked = []
+        stopped = []
+
+        async def fake_ack():
+            acked.append(True)
+
+        async def fake_stop(thread_ts):
+            stopped.append(thread_ts)
+            return True
+
+        monkeypatch.setattr(d._claude, "stop", fake_stop)
+
+        asyncio.run(d._handle_stop_button(fake_ack, self._body()))
+
+        assert acked == [True]          # acked within Slack's 3s window
+        assert stopped == ["thread.1"]  # value -> stop(thread_ts)
+        assert d._app.client.posted == [
+            {"channel": "C1", "thread_ts": "thread.1", "text": "⏹️ Stopped."}
+        ]
+
+    def test_button_noop_when_nothing_in_flight(self, monkeypatch):
+        d = make_daemon(monkeypatch)
+
+        async def fake_ack():
+            pass
+
+        async def fake_stop(thread_ts):
+            return False  # already finished
+
+        monkeypatch.setattr(d._claude, "stop", fake_stop)
+
+        asyncio.run(d._handle_stop_button(fake_ack, self._body()))
+
+        assert d._app.client.posted == []  # no stop notice when nothing was killed

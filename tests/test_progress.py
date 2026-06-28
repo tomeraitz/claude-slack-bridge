@@ -126,6 +126,16 @@ class _FakeClient:
         self.deletes.append(kwargs)
 
 
+def _stop_button(blocks):
+    """Return the stop button element in *blocks*, or None."""
+    for b in blocks:
+        if b.get("type") == "actions":
+            for el in b["elements"]:
+                if el.get("action_id") == "stop_run":
+                    return el
+    return None
+
+
 def test_reporter_creates_then_edits_one_message():
     client = _FakeClient()
     reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
@@ -141,12 +151,23 @@ def test_reporter_creates_then_edits_one_message():
     assert client.updates[0]["ts"] == "1700000000.0001"
 
 
-def test_reporter_done_snapshot_renders_summary():
+def test_reporter_live_message_has_stop_button():
+    client = _FakeClient()
+    reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
+    asyncio.run(reporter(_Progress(live="🔄 working", summary="s", done=False)))
+    btn = _stop_button(client.posts[0]["blocks"])
+    assert btn is not None
+    assert btn["value"] == "T1"      # carries the run's thread_ts for stop()
+    assert btn["style"] == "danger"
+
+
+def test_reporter_done_snapshot_renders_summary_without_button():
     client = _FakeClient()
     reporter = _ProgressReporter(client, channel="C1", thread_ts="T1")
     asyncio.run(reporter(_Progress(live="🔄 working", summary="✅ done", done=False)))
     asyncio.run(reporter(_Progress(live="🔄 working", summary="✅ done", done=True)))
     assert client.updates[-1]["text"] == "✅ done"       # summary, not live
+    assert _stop_button(client.updates[-1]["blocks"]) is None  # button gone when done
 
 
 def test_reporter_delete_removes_posted_message():

@@ -76,6 +76,23 @@
 
 ---
 
+## Step 4b — Enable Interactivity (for the 🛑 Stop button)
+
+The live status message the bot posts while working has a **🛑 Stop** button.
+Button clicks are delivered over Socket Mode, but Slack still requires
+Interactivity to be switched on:
+
+1. In the left sidebar, go to **Interactivity & Shortcuts**
+2. Toggle **Interactivity** → ON
+3. Leave the **Request URL** blank — Socket Mode delivers the events; no public
+   URL is needed.
+4. Click **Save Changes**
+
+> Skipping this only disables the button; the 🛑 *reaction* (Step 4) still stops
+> runs with no extra setup.
+
+---
+
 ## Step 5 — Create a Channel per Project
 
 1. In Slack, click **+** next to Channels → **Create channel**

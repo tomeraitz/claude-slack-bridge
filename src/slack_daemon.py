@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 
+# action_id of the 🛑 Stop button on the live status message. Clicking it routes
+# to _handle_stop_button (delivered over Socket Mode — requires Interactivity to
+# be enabled in the Slack app; no request URL is needed). The 🛑 *reaction* on
+# the trigger message remains as a no-config fallback.
+_STOP_ACTION_ID = "stop_run"
+
 # Replies that mean the run failed/stalled rather than producing an answer.
 # When one is returned, the live status message is removed so only the error
 # reply remains in the thread.
@@ -60,16 +66,36 @@ class _ProgressReporter:
         self._thread_ts = thread_ts
         self._status_ts: str | None = None
 
+    def _blocks(self, text: str, *, with_stop: bool) -> list[dict]:
+        """Status text as a section, plus a 🛑 Stop button while still running."""
+        blocks: list[dict] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+        ]
+        if with_stop:
+            blocks.append({
+                "type": "actions",
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🛑 Stop", "emoji": True},
+                    "style": "danger",
+                    "action_id": _STOP_ACTION_ID,
+                    "value": self._thread_ts,  # what _handle_stop_button stops
+                }],
+            })
+        return blocks
+
     async def __call__(self, progress: Any) -> None:
         text = progress.summary if progress.done else progress.live
+        # Drop the button once the run is done (summary snapshot).
+        blocks = self._blocks(text, with_stop=not progress.done)
         if self._status_ts is None:
             resp = await self._client.chat_postMessage(
-                channel=self._channel, thread_ts=self._thread_ts, text=text,
+                channel=self._channel, thread_ts=self._thread_ts, text=text, blocks=blocks,
             )
             self._status_ts = resp["ts"]
         else:
             await self._client.chat_update(
-                channel=self._channel, ts=self._status_ts, text=text,
+                channel=self._channel, ts=self._status_ts, text=text, blocks=blocks,
             )
 
     async def delete(self) -> None:
@@ -112,6 +138,7 @@ class SlackDaemon:
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
         self._app.event("reaction_added")(self._handle_reaction_added)
+        self._app.action(_STOP_ACTION_ID)(self._handle_stop_button)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -217,6 +244,30 @@ class SlackDaemon:
         killed = await self._claude.stop(thread_ts)
         if not killed:
             return  # nothing in flight to stop
+
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text="⏹️ Stopped."
+            )
+        except Exception as exc:
+            logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
+
+    async def _handle_stop_button(self, ack, body: dict) -> None:
+        """Stop a run when the 🛑 Stop button on its status message is clicked.
+
+        Mirrors the 🛑-reaction path: the button's ``value`` carries the run's
+        thread_ts, so we kill that run and post the stop notice. The run task
+        then deletes its (button-bearing) status message via the reporter.
+        """
+        await ack()  # acknowledge within Slack's 3s window before doing work
+        actions = body.get("actions") or []
+        thread_ts = actions[0].get("value") if actions else None
+        if not thread_ts:
+            return
+        channel = (body.get("channel") or {}).get("id", "")
+        killed = await self._claude.stop(thread_ts)
+        if not killed:
+            return  # nothing in flight (already finished / stopped)
 
         try:
             await self._app.client.chat_postMessage(

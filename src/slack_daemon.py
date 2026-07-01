@@ -300,7 +300,13 @@ class SlackDaemon:
             # with a one-line summary so the CLI can confirm what loaded.
             if parts and parts[0] == "RELOAD":
                 count = await self._claude.reload_projects()
-                writer.write(f"reloaded {count} channel(s)\n".encode())
+                summary = f"reloaded {count} channel(s)"
+                missing = self._claude.missing_project_dirs()
+                if missing:
+                    summary += " — ⚠ {} with missing dir: {}".format(
+                        len(missing), ", ".join(p for _, p in missing)
+                    )
+                writer.write((summary + "\n").encode())
                 await writer.drain()
                 return
 

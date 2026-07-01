@@ -103,6 +103,84 @@ class TestReloadProjects:
         assert handler._channel_id_to_project == before  # unchanged on failure
 
 
+class TestReloadPreflight:
+    def test_missing_project_dirs_flags_only_the_bad_path(self, tmp_path, projects_file):
+        # #alpha → a real dir, #beta → a path that doesn't exist. Both resolve
+        # to channel IDs, so preflight (not resolution) is what catches #beta.
+        channels = [{"name": "alpha", "id": "C_ALPHA"}, {"name": "beta", "id": "C_BETA"}]
+        handler = make_handler(tmp_path, channels)
+        good = str(tmp_path)
+
+        async def run():
+            projects_file({"#alpha": good, "#beta": "/no/such/dir"})
+            await handler.reload_projects()
+
+        asyncio.run(run())
+        missing = handler.missing_project_dirs()
+        assert missing == [("C_BETA", "/no/such/dir")]
+
+    def test_all_dirs_present_reports_none(self, tmp_path, projects_file):
+        handler = make_handler(tmp_path, [{"name": "alpha", "id": "C_ALPHA"}])
+
+        async def run():
+            projects_file({"#alpha": str(tmp_path)})
+            await handler.reload_projects()
+
+        asyncio.run(run())
+        assert handler.missing_project_dirs() == []
+
+
+class TestSelfHealThreadDir:
+    def test_reply_reresolves_when_cached_dir_is_missing(self, tmp_path, monkeypatch):
+        # A thread cached a dir that has since gone missing (bad path, later
+        # fixed + reloaded). The next reply must re-resolve to the current
+        # mapping instead of spawning into the dead dir.
+        handler = make_handler(tmp_path, [])
+        good = str(tmp_path)
+        handler._channel_id_to_project["C1"] = {
+            "path": good, "plugin_dir": None, "worktrees": {},
+        }
+        handler._thread_config["T1"] = ("/no/such/dir", None)  # stale, missing
+        handler._sessions["T1"] = "sess"
+
+        # Force the hot --resume path and capture the cwd _run_claude receives.
+        jsonl = tmp_path / "sess.jsonl"
+        jsonl.write_text("{}")
+        monkeypatch.setattr(claude_handler, "_jsonl_path", lambda cwd, sid: jsonl)
+
+        seen = {}
+
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, **kwargs):
+            seen["cwd"] = cwd
+            return "ok"
+
+        monkeypatch.setattr(handler, "_run_claude", fake_run)
+
+        reply = asyncio.run(handler.handle_thread_reply("C1", "T1", "hi"))
+        assert reply == "ok"
+        assert seen["cwd"] == good                       # healed, not the dead dir
+        assert handler._thread_config["T1"] == (good, None)
+
+    def test_reply_keeps_cached_dir_when_still_valid(self, tmp_path, monkeypatch):
+        # A healthy cached dir is left untouched (no needless re-resolve).
+        handler = make_handler(tmp_path, [])
+        handler._thread_config["T1"] = (str(tmp_path), None)
+        handler._sessions["T1"] = "sess"
+        jsonl = tmp_path / "sess.jsonl"
+        jsonl.write_text("{}")
+        monkeypatch.setattr(claude_handler, "_jsonl_path", lambda cwd, sid: jsonl)
+
+        seen = {}
+
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, **kwargs):
+            seen["cwd"] = cwd
+            return "ok"
+
+        monkeypatch.setattr(handler, "_run_claude", fake_run)
+        asyncio.run(handler.handle_thread_reply("C1", "T1", "hi"))
+        assert seen["cwd"] == str(tmp_path)
+
+
 class TestReloadctl:
     def test_round_trips_summary_over_socket(self, tmp_path):
         sock = str(tmp_path / "bridge.sock")
@@ -159,6 +237,9 @@ class TestReloadVerbAndSignal:
             class StubClaude:
                 async def reload_projects(self):
                     return 5
+
+                def missing_project_dirs(self):
+                    return []
 
             daemon._claude = StubClaude()
 

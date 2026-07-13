@@ -303,6 +303,23 @@ class ClaudeHandler:
         # config only if the thread state was lost (container restart).
         project_dir, plugin_dir = self._thread_config.get(thread_ts) or self._get_project_config(channel)
 
+        # Self-heal a stale cache: if the thread's dir has gone missing (e.g. a
+        # projects.json path was wrong, then fixed + reloaded), re-resolve from
+        # the current mapping instead of spawning into a dir that can't run.
+        if project_dir is not None and not os.path.isdir(project_dir):
+            fresh_dir, fresh_plugin = self._get_project_config(channel)
+            if fresh_dir is not None and os.path.isdir(fresh_dir):
+                logger.warning(
+                    "Thread %s cwd %s is gone — re-resolved to %s after reload.",
+                    thread_ts, project_dir, fresh_dir,
+                )
+                project_dir, plugin_dir = fresh_dir, fresh_plugin
+                self._thread_config[thread_ts] = (project_dir, plugin_dir)
+                session_store.upsert(
+                    thread_ts, cwd=project_dir, plugin_dir=plugin_dir,
+                    path=self._store_path,
+                )
+
         if session_id and _jsonl_path(project_dir, session_id).exists():
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             prompt = _append_attachment_note(text, files or [])
@@ -401,8 +418,65 @@ class ClaudeHandler:
         )
         return path, plugin_dir
 
+    async def reload_projects(self) -> int:
+        """Re-read projects.json and re-resolve channel IDs, live.
+
+        Lets a ``projects.json`` edit take effect without restarting the daemon,
+        so the Slack connection and any in-flight runs are left untouched. It is
+        triggered two ways (see docs/reloading-projects.md):
+
+          * the ``RELOAD`` socket verb, sent by ``reloadctl.py`` (which replies
+            with the channel count so the operator gets confirmation), and
+          * a ``SIGHUP`` to the daemon (the ops idiom, e.g. ``pm2 sendSignal``).
+
+        A live thread keeps the ``(cwd, plugin_dir)`` cached in
+        ``_thread_config`` when it started, so a reload never relocates a
+        running conversation — with one safe exception: if that cached dir has
+        since gone missing, the next reply re-resolves it from the current
+        mapping (see ``handle_thread_reply``), since a missing dir can't run
+        anyway. If the re-resolve fails (e.g. a Slack API error), the previous
+        mapping is preserved.
+
+        Returns the number of channels mapped after the reload. Mapped paths
+        that don't exist on disk are logged as warnings so an operator sees the
+        mistake at reload time, before any message hits the bad path.
+        """
+        self._project_map = _load_project_map()
+        if self._project_map:
+            await self._resolve_channel_ids()
+        else:
+            self._channel_id_to_project = {}
+        count = len(self._channel_id_to_project)
+        missing = self.missing_project_dirs()
+        if missing:
+            logger.warning(
+                "Reload: %d channel(s) map to a missing directory: %s",
+                len(missing), ", ".join(p for _, p in missing),
+            )
+        logger.info("Reloaded project map: %d channel(s) mapped.", count)
+        return count
+
+    def missing_project_dirs(self) -> list[tuple[str, str]]:
+        """``(channel_id, path)`` for mapped channels whose path is not a dir.
+
+        Read-only preflight over the resolved mapping: a channel resolves fine
+        (name→ID) yet still point at a path that doesn't exist on disk, which
+        would fail only later when a message tries to spawn there. Surfacing it
+        at reload time turns a confusing mid-run error into an obvious one.
+        """
+        return [
+            (cid, cfg["path"])
+            for cid, cfg in self._channel_id_to_project.items()
+            if cfg.get("path") and not os.path.isdir(cfg["path"])
+        ]
+
     async def _resolve_channel_ids(self) -> None:
-        """Resolve channel names from project_map to Slack channel IDs."""
+        """Resolve channel names from project_map to Slack channel IDs.
+
+        Builds the mapping in a local dict and swaps it in atomically at the
+        end, so a message arriving mid-reload never observes a partial (or
+        empty) mapping, and a mid-way failure leaves the previous one intact.
+        """
         try:
             result = await self._slack_client.conversations_list(
                 types="public_channel,private_channel", limit=1000,
@@ -415,6 +489,7 @@ class ClaudeHandler:
                 name_to_id[ch["name"]] = ch["id"]
                 name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
 
+            resolved: dict[str, dict] = {}
             for channel_key, value in self._project_map.items():
                 # Normalise the legacy string format and the dict format.
                 if isinstance(value, str):
@@ -429,7 +504,7 @@ class ClaudeHandler:
                 # DM channel IDs (D...) and raw channel IDs (C...) are not
                 # returned by conversations_list — register them directly.
                 if channel_key.startswith(("C", "D")) and channel_key not in name_to_id:
-                    self._channel_id_to_project[channel_key] = config
+                    resolved[channel_key] = config
                     logger.info(
                         "Mapped %s (raw ID) → %s%s",
                         channel_key, config["path"],
@@ -439,7 +514,7 @@ class ClaudeHandler:
 
                 channel_id = name_to_id.get(channel_key)
                 if channel_id:
-                    self._channel_id_to_project[channel_id] = config
+                    resolved[channel_id] = config
                     logger.info(
                         "Mapped %s (ID: %s) → %s%s",
                         channel_key, channel_id, config["path"],
@@ -447,6 +522,8 @@ class ClaudeHandler:
                     )
                 else:
                     logger.warning("Channel %s not found in workspace — skipping.", channel_key)
+
+            self._channel_id_to_project = resolved
 
         except Exception as exc:
             logger.error("Failed to resolve channel IDs: %s", exc)
@@ -525,6 +602,16 @@ class ClaudeHandler:
                 start_new_session=True,
             )
         except FileNotFoundError:
+            # create_subprocess_exec raises FileNotFoundError for two unrelated
+            # causes: the claude binary is not on PATH, or `cwd` (the project
+            # dir from projects.json) does not exist. Don't blame the CLI for a
+            # bad project path — name the path so the fix is obvious.
+            if cwd is not None and not os.path.isdir(cwd):
+                logger.error("Project directory does not exist: %s", cwd)
+                return (
+                    f"Sorry, the project directory doesn't exist: `{cwd}`. "
+                    "Fix the path in projects.json and run ./reload-mapping.sh."
+                )
             logger.error("claude CLI not found — is it installed and in PATH?")
             return "Sorry, the Claude CLI is not available."
 

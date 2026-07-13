@@ -16,6 +16,7 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 import asyncio
 import logging
 import os
+import signal
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -295,6 +296,20 @@ class SlackDaemon:
             line = await asyncio.wait_for(reader.readline(), timeout=10.0)
             parts = line.decode().strip().split(" ", 1)
 
+            # RELOAD: re-read projects.json live (sent by reloadctl.py). Reply
+            # with a one-line summary so the CLI can confirm what loaded.
+            if parts and parts[0] == "RELOAD":
+                count = await self._claude.reload_projects()
+                summary = f"reloaded {count} channel(s)"
+                missing = self._claude.missing_project_dirs()
+                if missing:
+                    summary += " — ⚠ {} with missing dir: {}".format(
+                        len(missing), ", ".join(p for _, p in missing)
+                    )
+                writer.write((summary + "\n").encode())
+                await writer.drain()
+                return
+
             if len(parts) != 2 or parts[0] != "REGISTER":
                 logger.warning("Bad session registration: %r", line)
                 return
@@ -318,10 +333,37 @@ class SlackDaemon:
             if not writer.is_closing():
                 writer.close()
 
+    def _install_reload_signal(self) -> None:
+        """Reload projects.json on SIGHUP — the ops idiom (``pm2 sendSignal SIGHUP``).
+
+        ``add_signal_handler`` schedules work on the running loop; the handler
+        itself can't be a coroutine, so it spawns a task. Guarded because
+        SIGHUP / ``add_signal_handler`` aren't available on every platform
+        (e.g. Windows) — the ``RELOAD`` socket verb still works there.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(self._reload_projects_on_signal()),
+            )
+            logger.info("SIGHUP will reload projects.json (no restart).")
+        except (NotImplementedError, AttributeError, ValueError):
+            logger.info("SIGHUP reload unavailable on this platform; use the RELOAD socket verb.")
+
+    async def _reload_projects_on_signal(self) -> None:
+        """Run a projects.json reload triggered by SIGHUP, logging the outcome."""
+        try:
+            count = await self._claude.reload_projects()
+            logger.info("SIGHUP reload complete: %d channel(s) mapped.", count)
+        except Exception as exc:  # noqa: BLE001 — a failed reload must not crash the daemon
+            logger.error("SIGHUP reload failed: %s", exc)
+
     async def start(self) -> None:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
+        self._install_reload_signal()
 
         try:
             recovered = await recover_interrupted_runs(self._app.client)

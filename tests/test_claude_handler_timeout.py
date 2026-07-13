@@ -39,7 +39,7 @@ def test_thread_reply_delivers_timeout_without_retry(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         calls.append(prompt)
         return _TIMEOUT_REPLY
 
@@ -59,7 +59,7 @@ def test_thread_reply_still_retries_genuine_failure(tmp_path, monkeypatch):
     sentinel = "Sorry, I encountered an error processing your request."
     calls = []
 
-    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         calls.append(prompt)
         return sentinel
 

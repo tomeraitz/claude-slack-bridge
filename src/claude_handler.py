@@ -26,6 +26,7 @@ resulting thread stay in that worktree without re-tagging.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -33,12 +34,33 @@ import re
 import session_store
 import signal
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-SUBPROCESS_TIMEOUT = 300  # 5 minutes
+# A run is killed only after IDLE_TIMEOUT seconds with NO stream activity
+# (genuinely stuck), not on total wall-clock time — so long tasks run to
+# completion and the user stops them with 🛑 instead of hitting a fixed cap.
+# A long Bash/build emits no events while running, so keep this generous; set
+# IDLE_TIMEOUT_SECONDS=0 to disable the watchdog and rely solely on 🛑.
+IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 min
+# Live progress: aggregate stream events and edit a single Slack status
+# message at most once every PROGRESS_INTERVAL seconds (≤0 falls back to 10).
+PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL_SECONDS", "10"))
+# Max recent actions the live status shows (rolling, newest first). Beyond this
+# the rest collapse into "… and N more". ≤0 falls back to 99.
+PROGRESS_ACTIONS = int(os.environ.get("PROGRESS_ACTIONS", "99"))
+# After this many seconds with no stream event, the live status shows an "⏳ idle"
+# hint (the run is on a long quiet step, e.g. a slow build). Distinct from
+# IDLE_TIMEOUT, which kills the run; this only annotates it.
+IDLE_HINT = float(os.environ.get("IDLE_HINT_SECONDS", "30"))
+
+# A progress callback receives an immutable snapshot of run progress and pushes
+# it to Slack (create/edit a status message). Owned by the daemon; the handler
+# only decides *when* to call it (throttled aggregation + a final summary).
+ProgressCb = Callable[["_Progress"], Awaitable[None]]
 # Claude CLI in stream-json mode emits one JSON event per line. A single
 # event can embed large tool inputs/results (file reads, MCP responses,
 # task outputs), easily exceeding asyncio's default 64 KB StreamReader
@@ -71,12 +93,12 @@ _RUN_FAILURE_SENTINELS = frozenset({
 # resume policy does NOT retry. Intentionally NOT in _RUN_FAILURE_SENTINELS.
 _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
 
-# A run that exceeds SUBPROCESS_TIMEOUT is NOT a transient failure either: the
-# run was making progress but won't fit the window, so retrying (then scraping)
-# just serially re-runs the same expensive work — up to 3× the timeout — while
-# the user sees nothing at all. Surface this immediately and do NOT retry.
-# Intentionally NOT in _RUN_FAILURE_SENTINELS.
-_TIMEOUT_REPLY = "Sorry, the request timed out before it could finish. Try a smaller step or rephrase."
+# A run the idle watchdog kills (no activity for IDLE_TIMEOUT) is NOT a transient
+# failure: it was either making progress and stalled, or genuinely stuck, so
+# retrying (then scraping) just serially re-runs the same expensive work while
+# the user sees nothing. Surface this immediately and do NOT retry. Intentionally
+# NOT in _RUN_FAILURE_SENTINELS.
+_TIMEOUT_REPLY = "Sorry, the run stalled with no activity and was stopped. Try again or break it into a smaller step."
 
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
@@ -217,6 +239,582 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
         _sigkill(child)
 
 
+# ----------------------------------------------------------------------
+# Live progress (derived purely from the stream-json the CLI already emits —
+# no extra LLM calls). The tracker accumulates events; the handler renders a
+# snapshot at most once per PROGRESS_INTERVAL and a final summary at the end.
+# ----------------------------------------------------------------------
+
+# tool name -> (emoji, present-tense verb) for the live status line.
+_TOOL_VERB: dict[str, tuple[str, str]] = {
+    "Read": ("📖", "Reading"),
+    "Edit": ("✏️", "Editing"),
+    "Write": ("✏️", "Writing"),
+    "MultiEdit": ("✏️", "Editing"),
+    "NotebookEdit": ("✏️", "Editing"),
+    "Bash": ("⚙️", "Running"),
+    "Grep": ("🔍", "Searching"),
+    "Glob": ("🔍", "Searching"),
+    "WebFetch": ("🌐", "Fetching"),
+    "WebSearch": ("🌐", "Searching"),
+    "Task": ("🤖", "Subagent"),
+    "TodoWrite": ("📝", "Planning"),
+}
+# Tools that mutate files — counted toward the "N files changed" tally.
+_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact human duration: ``45s``, ``2m14s``, ``1h03m``."""
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+def _count_lines(text: str) -> int:
+    """Line count of *text* (0 for empty). Used for edit churn (+/−)."""
+    return text.count("\n") + 1 if text else 0
+
+
+def _edit_churn(name: str, inp: dict) -> tuple[int, int]:
+    """Approximate (added, removed) line churn from an edit tool's input (no real diff)."""
+    if name == "MultiEdit":
+        added = removed = 0
+        for e in inp.get("edits") or []:
+            if isinstance(e, dict):
+                removed += _count_lines(e.get("old_string") or "")
+                added += _count_lines(e.get("new_string") or "")
+        return added, removed
+    if name == "Write":
+        return _count_lines(inp.get("content") or ""), 0
+    if name == "NotebookEdit":
+        return _count_lines(inp.get("new_source") or ""), 0
+    return _count_lines(inp.get("new_string") or ""), _count_lines(inp.get("old_string") or "")  # Edit
+
+
+def _tool_result_text(block: dict) -> str:
+    """Flatten a tool_result block's content (string or list of parts) to text."""
+    content = block.get("content", "")
+    if isinstance(content, list):
+        return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return str(content or "")
+
+
+def _clip(text: str, limit: int) -> str:
+    """Trim *text* to ~*limit* chars on a word boundary, adding '…' when cut."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return (text[:limit].rsplit(" ", 1)[0] or text[:limit]) + "…"
+
+
+# The live status ticker posts as mrkdwn but shows Claude's own prose, which is
+# standard Markdown. mrkdwn renders **bold** / [text](url) literally, so reduce
+# inline Markdown to plain text — the ticker is an ephemeral status line, not
+# formatted output. Only *paired* markers are stripped, so a lone underscore in
+# snake_case or a spaced "*" survives. Order matters: links and code spans (which
+# may contain "*") first, then bold before italic so "**" isn't read as two
+# italic markers.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_BOLD_RE = re.compile(r"(\*\*|__)(.+?)\1")
+_MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
+_MD_ITALIC_RE = re.compile(r"(?<!\w)([*_])(?!\s)(.+?)(?<!\s)\1(?!\w)")
+
+
+def _strip_inline_md(text: str) -> str:
+    """Reduce inline Markdown in *text* to plain text for the live status ticker."""
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_CODE_RE.sub(r"\1", text)
+    text = _MD_BOLD_RE.sub(r"\2", text)
+    text = _MD_STRIKE_RE.sub(r"\1", text)
+    text = _MD_ITALIC_RE.sub(r"\2", text)
+    return text
+
+
+# Keep the actions section under Slack's ~3000-char block limit (the PROGRESS_ACTIONS
+# count cap and this char cap both apply, whichever hits first).
+_ACTIONS_CHARS = 2500
+# Max todo lines shown in the live checklist before collapsing the tail.
+_TODOS_MAX = 15
+# Max per-file lines in the changed-files section (Slack "Show more" collapses it).
+_FILES_MAX = 99
+# Status icon per todo state (no interactive checkboxes in a posted message).
+_TODO_ICON = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
+# Context-window sizes (max input tokens) for the "ctx used/window" readout,
+# keyed by model substring. Loaded from model_context.json at the repo root so
+# they can be updated without a code change; the built-in map below is the
+# fallback when the file is missing or malformed.
+_MODEL_CONTEXT_CONFIG = Path(__file__).parent.parent / "model_context.json"
+_BUILTIN_MODEL_CONTEXT = {
+    "haiku": 200_000,
+    "fable": 1_000_000,
+    "mythos": 1_000_000,
+    "opus": 1_000_000,
+    "sonnet": 1_000_000,
+}
+
+
+# USD per 1M tokens (input, output) by model substring; fallback when the file
+# has no prices. Cache read ≈ 0.1× input, cache write ≈ 1.25× input.
+_BUILTIN_MODEL_PRICES = {
+    "haiku": (1.0, 5.0),
+    "fable": (10.0, 50.0),
+    "mythos": (10.0, 50.0),
+    "opus": (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
+}
+
+
+def _load_model_context() -> tuple[dict[str, int], int]:
+    """Return (window-by-substring, default) from model_context.json, or built-ins."""
+    try:
+        with open(_MODEL_CONTEXT_CONFIG) as f:
+            cfg = json.load(f)
+        windows = {str(k).lower(): int(v) for k, v in (cfg.get("windows") or {}).items()}
+        default = int(cfg.get("default", 200_000))
+        if windows:
+            return windows, default
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("model_context.json unusable (%s) — using built-in windows.", exc)
+    return dict(_BUILTIN_MODEL_CONTEXT), 200_000
+
+
+def _load_model_prices() -> dict[str, tuple[float, float]]:
+    """Return {substring: (in_price, out_price)} from model_context.json, or built-ins."""
+    try:
+        with open(_MODEL_CONTEXT_CONFIG) as f:
+            cfg = json.load(f)
+        prices = {
+            str(k).lower(): (float(v["in"]), float(v["out"]))
+            for k, v in (cfg.get("prices") or {}).items()
+            if isinstance(v, dict) and "in" in v and "out" in v
+        }
+        if prices:
+            return prices
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        logger.warning("model_context.json prices unusable (%s) — using built-ins.", exc)
+    return dict(_BUILTIN_MODEL_PRICES)
+
+
+_MODEL_CONTEXT, _DEFAULT_CONTEXT = _load_model_context()
+_MODEL_PRICES = _load_model_prices()
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: ``950``, ``4.2k``, ``18k``, ``1.2M``."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k".replace(".0k", "k")
+    return str(n)
+
+
+def _short_model(model: str) -> str:
+    """``claude-opus-4-8`` -> ``opus-4-8`` for the status line."""
+    return model[len("claude-"):] if model.startswith("claude-") else model
+
+
+def _model_context(model: str) -> int:
+    m = (model or "").lower()
+    for key, size in _MODEL_CONTEXT.items():
+        if key in m:
+            return size
+    return _DEFAULT_CONTEXT
+
+
+def _model_price(model: str) -> "tuple[float, float] | None":
+    """(input, output) USD per 1M tokens for *model*, or None if unknown."""
+    m = (model or "").lower()
+    for key, price in _MODEL_PRICES.items():
+        if key in m:
+            return price
+    return None
+
+
+def _estimate_cost(model: str, tok_in: int, tok_out: int, cache_r: int, cache_c: int) -> "float | None":
+    """Rough USD cost from token usage; None when the model price is unknown.
+
+    Cache reads bill ~0.1× input, cache writes ~1.25× input.
+    """
+    price = _model_price(model)
+    if price is None:
+        return None
+    pin, pout = price
+    return (tok_in * pin + tok_out * pout + cache_r * pin * 0.1 + cache_c * pin * 1.25) / 1_000_000
+
+
+def _fmt_cost(usd: float) -> str:
+    if usd < 0.01:
+        return "<$0.01"
+    if usd < 1:
+        return f"${usd:.2f}"        # $0.35
+    return f"${usd:.1f}"            # $22.1
+
+
+class _Progress(NamedTuple):
+    """An immutable progress snapshot handed to the daemon's ProgressCb.
+
+    While running the daemon shows ``live`` (the last N actions, newest first)
+    with ``meta`` rendered as a muted context line below it. ``summary`` is the
+    collapsed end-state (one headline + an auto-collapsed detail block); ``done``
+    tells the callback to render ``summary`` instead.
+    """
+
+    live: str
+    summary: str
+    done: bool
+    meta: str = ""
+    todos: str = ""  # checklist block (statuses), shown as its own section
+    files: str = ""  # changed-files block, shown as its own (collapsible) section
+
+
+class _ProgressTracker:
+    """Folds a stream of claude events into a renderable progress snapshot.
+
+    Deterministic and side-effect-free (no clock of its own, no I/O): callers
+    pass ``now`` so elapsed time is testable. ``dirty`` flags whether anything
+    changed since the last ``snapshot`` so the throttle can skip no-op edits.
+    Everything is derived from the events the CLI already emits — no LLM calls.
+    """
+
+    def __init__(self, start: float) -> None:
+        self._start = start
+        self._cap = PROGRESS_ACTIONS if PROGRESS_ACTIONS > 0 else 99
+        # Rolling action history (oldest→newest), retained a bit beyond the cap.
+        self._actions: deque[str] = deque(maxlen=max(200, self._cap + 1))
+        self._total = 0                      # actions ever recorded
+        self._tool_count = 0
+        self._files: list[str] = []          # ordered, unique edited/written paths
+        self._file_set: set[str] = set()
+        self._reads = 0
+        self._commands: list[str] = []       # first line of each Bash command
+        self._added = 0                      # lines added across edits (churn)
+        self._removed = 0                    # lines removed across edits (churn)
+        self._file_added: dict[str, int] = {}    # per-file added lines
+        self._file_removed: dict[str, int] = {}  # per-file removed lines
+        self._skills: list[str] = []         # skill names invoked (ordered, unique)
+        self._mcp: set[str] = set()          # MCP server names used (mcp__<server>__*)
+        self._compactions = 0                # times context was auto-compacted
+        self._errors = 0                     # tool_result blocks flagged is_error
+        self._last_error = ""                # first line of the latest error result
+        self._tool_counts: dict[str, int] = {}  # per-tool-name use counts
+        self._subagents = 0                  # Task tool launches
+        self._todos: list[tuple[str, str]] = []  # (content, status) latest TodoWrite
+        self._turns = 0                      # assistant turns (overridden by result)
+        self._model = ""                     # from system:init
+        self._tok_in = 0
+        self._tok_out = 0
+        self._tok_cache_r = 0                # cache READ tokens (reused context)
+        self._tok_cache_c = 0                # cache CREATION tokens
+        self._ctx_last = 0                   # prompt size of the most recent call
+        self._dirty = False
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def _push(self, action: str) -> None:
+        """Record the newest action, collapsing consecutive duplicates."""
+        if self._actions and self._actions[-1] == action:
+            return
+        self._actions.append(action)
+        self._total += 1
+        self._dirty = True
+
+    def ingest(self, event: Any) -> None:
+        """Update state from one stream-json event."""
+        if not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        if etype == "assistant":
+            self._turns += 1
+            message = event.get("message") or {}
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                self._add_usage(usage)
+            model = message.get("model")
+            if model and model != "<synthetic>":  # real id, e.g. claude-opus-4-8
+                self._model = model
+            for block in message.get("content", []) or []:
+                if isinstance(block, dict):
+                    self._ingest_assistant_block(block)
+        elif etype == "user":
+            # tool_result blocks ride on user events; count the failed ones.
+            for block in event.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" \
+                        and block.get("is_error"):
+                    self._errors += 1
+                    raw = _tool_result_text(block).strip()
+                    if raw:
+                        self._last_error = _clip(_strip_inline_md(raw.splitlines()[0]), 80)
+                    self._dirty = True
+        elif etype == "system":
+            if event.get("model"):
+                self._model = event["model"]
+            if event.get("subtype") == "compact_boundary":  # CLI auto-compaction marker
+                self._compactions += 1
+                self._dirty = True
+        elif etype == "result":
+            nt = event.get("num_turns")
+            if isinstance(nt, int) and nt > 0:
+                self._turns = nt
+            usage = event.get("usage")
+            if isinstance(usage, dict) and self._tok_out == 0:
+                self._add_usage(usage)  # fallback when per-turn usage was absent
+            self._dirty = True
+
+    def _add_usage(self, u: dict) -> None:
+        self._tok_in += u.get("input_tokens") or 0
+        self._tok_out += u.get("output_tokens") or 0
+        self._tok_cache_r += u.get("cache_read_input_tokens") or 0
+        self._tok_cache_c += u.get("cache_creation_input_tokens") or 0
+        # Full prompt size of THIS call = fresh input + cached (read + created).
+        self._ctx_last = (
+            (u.get("input_tokens") or 0)
+            + (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0)
+        )
+        self._dirty = True
+
+    def _ingest_assistant_block(self, block: dict) -> None:
+        btype = block.get("type")
+        if btype == "tool_use":
+            self._ingest_tool(block)
+        elif btype == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                self._push("💬 " + _clip(_strip_inline_md(text.splitlines()[0]), 400))
+        elif btype == "thinking":
+            if (block.get("thinking") or "").strip():
+                self._push("🤔 Thinking…")
+        elif btype == "compaction":  # API compaction content block
+            self._compactions += 1
+            self._dirty = True
+
+    def _ingest_tool(self, block: dict) -> None:
+        name = block.get("name", "") or "Tool"
+        inp = block.get("input", {}) or {}
+        self._tool_count += 1
+        self._tool_counts[name] = self._tool_counts.get(name, 0) + 1
+        if name == "Task":
+            self._subagents += 1
+        elif name == "TodoWrite":
+            self._ingest_todos(inp)
+        elif name == "Skill":
+            sk = inp.get("skill") or inp.get("command") or inp.get("name")
+            if sk:
+                short = str(sk).split(":")[-1]  # "superpowers:brainstorming" -> "brainstorming"
+                if short not in self._skills:
+                    self._skills.append(short)
+        if name.startswith("mcp__"):
+            parts = name.split("__")  # mcp__<server>__<tool>
+            if len(parts) >= 3:
+                self._mcp.add(parts[1])
+        emoji, verb = _TOOL_VERB.get(name, ("🔧", name))
+        arg = ""
+        if name == "Skill":
+            emoji, verb = "🧩", "Skill"
+            arg = f"`{self._skills[-1]}`" if self._skills else ""
+        elif name.startswith("mcp__"):  # 🔌 <tool> — server is in the MCP line
+            emoji, verb = "🔌", name.split("__")[-1]
+        elif name in _EDIT_TOOLS:
+            path = inp.get("file_path") or inp.get("notebook_path") or ""
+            if path:
+                if path not in self._file_set:
+                    self._file_set.add(path)
+                    self._files.append(path)
+                arg = f"`{os.path.basename(path)}`"
+            a, r = _edit_churn(name, inp)
+            self._added += a
+            self._removed += r
+            if path:
+                self._file_added[path] = self._file_added.get(path, 0) + a
+                self._file_removed[path] = self._file_removed.get(path, 0) + r
+        elif name == "Read":
+            self._reads += 1
+            path = inp.get("file_path") or ""
+            arg = f"`{os.path.basename(path)}`" if path else ""
+        elif name == "Bash":
+            cmd = (inp.get("command") or "").strip()
+            if cmd:
+                first = cmd.splitlines()[0]
+                self._commands.append(first)
+                arg = f"`{_clip(first, 160)}`"
+        elif name in ("Grep", "Glob"):
+            pat = inp.get("pattern") or inp.get("query") or ""
+            arg = f"`{_clip(pat, 120)}`" if pat else ""
+        elif name in ("WebFetch", "WebSearch"):
+            ref = inp.get("url") or inp.get("query") or ""
+            arg = f"`{_clip(ref, 120)}`" if ref else ""
+        self._push(f"{emoji} {verb} {arg}".strip())
+
+    def _ingest_todos(self, inp: dict) -> None:
+        """Capture the latest TodoWrite list (it replaces the whole list each call)."""
+        parsed: list[tuple[str, str]] = []
+        for t in inp.get("todos") or []:
+            if isinstance(t, dict):
+                content = t.get("content") or t.get("activeForm") or ""
+                if content:
+                    parsed.append((content, t.get("status") or "pending"))
+        if parsed:
+            self._todos = parsed
+            self._dirty = True
+
+    # -- rendering helpers --------------------------------------------------
+
+    def _tool_breakdown(self) -> str:
+        """Per-tool counts, busiest first: ``8 read · 5 edit · 3 bash``.
+
+        MCP tools (``mcp__server__tool``) collapse to a single ``mcp`` bucket so
+        their long names don't blow up the line — the servers are listed separately.
+        """
+        if not self._tool_counts:
+            return "0 tools"
+        grouped: dict[str, int] = {}
+        for name, n in self._tool_counts.items():
+            key = "mcp" if name.startswith("mcp__") else name.lower()
+            grouped[key] = grouped.get(key, 0) + n
+        ordered = sorted(grouped.items(), key=lambda kv: (-kv[1], kv[0]))
+        return " · ".join(f"{n} {key}" for key, n in ordered[:6])
+
+    def _files_block(self) -> str:
+        """Header + a bulleted list of changed files with per-file churn.
+
+        A plain mrkdwn section (keeps `code`/bold) — a long one gets Slack's own
+        "Show more" collapse. Per-file +/− is churn, not a real diff (Slack has no
+        nested collapsible blocks).
+        """
+        if not self._files:
+            return ""
+        n = len(self._files)
+        churn = f" (+{self._added}/−{self._removed})" if (self._added or self._removed) else ""
+        lines = [f"📝 *{n} file{'s' if n != 1 else ''} changed*{churn}"]
+        for path in self._files[:_FILES_MAX]:
+            a = self._file_added.get(path, 0)
+            r = self._file_removed.get(path, 0)
+            per = f"  +{a}/−{r}" if (a or r) else ""
+            lines.append(f"• `{os.path.basename(path)}`{per}")
+        if n > _FILES_MAX:
+            lines.append(f"…and {n - _FILES_MAX} more")
+        return "\n".join(lines)
+
+    def _todos_block(self) -> str:
+        """Checklist of the current todos with status icons (empty when none)."""
+        if not self._todos:
+            return ""
+        done = sum(1 for _, s in self._todos if s == "completed")
+        lines = [f"📋 *Todos {done}/{len(self._todos)}*"]
+        for content, status in self._todos[:_TODOS_MAX]:
+            icon = _TODO_ICON.get(status, "⬜")
+            lines.append(f"{icon} {_clip(_strip_inline_md(content), 80)}")
+        if len(self._todos) > _TODOS_MAX:
+            lines.append(f"…+{len(self._todos) - _TODOS_MAX} more")
+        return "\n".join(lines)
+
+    def _tokens_str(self) -> str:
+        s = (
+            f"🪙 ↑{_fmt_tokens(self._tok_in)} ↓{_fmt_tokens(self._tok_out)}"
+            f" ⚡{_fmt_tokens(self._tok_cache_r)}"
+        )
+        cost = _estimate_cost(
+            self._model, self._tok_in, self._tok_out, self._tok_cache_r, self._tok_cache_c
+        )
+        if cost is not None:
+            s += f" ({_fmt_cost(cost)})"   # 🪙 ↑12k ↓4.2k ⚡368k ($22)
+        return s
+
+    def _meta(self, elapsed: str) -> str:
+        """Muted context block: activity line + resource line."""
+        line_a: list[str] = [self._tool_breakdown()]
+        if self._subagents:
+            line_a.append(f"🤖 {self._subagents} subagent{'s' if self._subagents != 1 else ''}")
+        if self._compactions:
+            line_a.append(f"🗜️ compacted {self._compactions}×")
+        if self._errors:
+            err = f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}"
+            if self._last_error:
+                err += f": {self._last_error}"
+            line_a.append(err)
+        line_a.append(elapsed)
+
+        line_b: list[str] = []
+        if self._tok_out or self._tok_in:
+            line_b.append(self._tokens_str())
+        if self._ctx_last:  # used/window AND % (window is per-model, so % stays sane)
+            window = _model_context(self._model)
+            pct = round(self._ctx_last / window * 100)
+            line_b.append(f"ctx {_fmt_tokens(self._ctx_last)}/{_fmt_tokens(window)} ({pct}%)")
+        if self._turns:
+            line_b.append(f"{self._turns} turn{'s' if self._turns != 1 else ''}")
+        if self._model:
+            line_b.append(_short_model(self._model))
+
+        line_c: list[str] = []
+        if self._skills:
+            line_c.append("🧩 " + ", ".join(self._skills[:6]))
+        if self._mcp:
+            line_c.append("🔌 " + ", ".join(sorted(self._mcp)[:6]))
+
+        lines = [" · ".join(line_a)]
+        if line_b:
+            lines.append(" · ".join(line_b))
+        if line_c:
+            lines.append(" · ".join(line_c))
+        return "\n".join(lines)
+
+    def snapshot(self, now: float, *, done: bool = False, idle: float = 0.0) -> _Progress:
+        """Render the current state; clears ``dirty``.
+
+        Shows the most recent actions (up to PROGRESS_ACTIONS), newest first;
+        anything older collapses into "… and N more". *idle* (seconds since the
+        last stream event) surfaces an "⏳ idle" hint at the top when quiet.
+        """
+        self._dirty = False
+        elapsed = _fmt_duration(now - self._start)
+        candidates = list(reversed(self._actions))  # newest first
+        shown: list[str] = []
+        used = 0
+        # Number actions by their position in the whole run (newest = highest), so
+        # the count is visible and new actions clearly append at the top.
+        for k, line in enumerate(candidates[:self._cap]):
+            numbered = f"`{self._total - k}.` {line}"
+            if shown and used + len(numbered) + 1 > _ACTIONS_CHARS:
+                break                            # keep the section under Slack's limit
+            shown.append(numbered)
+            used += len(numbered) + 1
+        hidden = max(0, self._total - len(shown))   # everything not shown
+        lines = list(shown)
+        if hidden:
+            lines.append(f"… and {hidden} more")
+        if not done and idle >= IDLE_HINT:       # surface a stuck/quiet run
+            lines.insert(0, f"⏳ idle {_fmt_duration(idle)} — still on the current step")
+        live = "\n".join(lines) if lines else "🔄 Working…"
+        return _Progress(
+            live=live, meta=self._meta(elapsed), todos=self._todos_block(),
+            files=self._files_block(), summary=self._render_summary(elapsed), done=done,
+        )
+
+    def _render_summary(self, elapsed: str) -> str:
+        """One-line "✅ Done" headline. The full detail stays in the live sections,
+        which the daemon keeps below this headline on completion (not collapsed)."""
+        head_parts: list[str] = []
+        if self._files:
+            head_parts.append(
+                f"{len(self._files)} file{'s' if len(self._files) != 1 else ''} changed"
+            )
+        if self._added or self._removed:
+            head_parts.append(f"+{self._added}/−{self._removed}")
+        head_parts.append(f"{self._tool_count} tool{'s' if self._tool_count != 1 else ''}")
+        if self._errors:
+            head_parts.append(f"⚠️ {self._errors} error{'s' if self._errors != 1 else ''}")
+        head_parts.append(elapsed)
+        return "✅ Done · " + " · ".join(head_parts)
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -266,6 +864,7 @@ class ClaudeHandler:
     async def handle_message(
         self, channel: str, message_ts: str, text: str,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         label, text = _parse_worktree_tag(text)
@@ -283,11 +882,15 @@ class ClaudeHandler:
 
         prompt = _append_attachment_note(text, files or [])
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel)
+        return await self._run_claude(
+            cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel,
+            progress_cb=progress_cb,
+        )
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Handle a threaded reply: resume the real session, else scrape once.
 
@@ -324,11 +927,17 @@ class ClaudeHandler:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             prompt = _append_attachment_note(text, files or [])
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(
+                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+                progress_cb=progress_cb,
+            )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed; retrying once.", session_id)
-            reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+            reply = await self._run_claude(
+                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+                progress_cb=progress_cb,
+            )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
@@ -338,11 +947,14 @@ class ClaudeHandler:
                 thread_ts, session_id,
             )
 
-        return await self._scrape_and_run(channel, thread_ts, project_dir, plugin_dir, files)
+        return await self._scrape_and_run(
+            channel, thread_ts, project_dir, plugin_dir, files, progress_cb=progress_cb,
+        )
 
     async def _scrape_and_run(
         self, channel: str, thread_ts: str, project_dir: str | None, plugin_dir: str | None,
         files: list[tuple[str, str]] | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
         """Last-resort fallback: replay scraped thread history under a NEW session.
 
@@ -353,7 +965,10 @@ class ClaudeHandler:
         prompt = _append_attachment_note(prompt, files or [])
         new_id = str(uuid.uuid4())
         cmd = self._build_cmd(session_id=new_id, plugin_dir=plugin_dir)
-        reply = await self._run_claude(cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel)
+        reply = await self._run_claude(
+            cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
+            progress_cb=progress_cb,
+        )
         self._sessions[thread_ts] = new_id
         self._thread_config[thread_ts] = (project_dir, plugin_dir)
         session_store.upsert(
@@ -580,8 +1195,16 @@ class ClaudeHandler:
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None,
         thread_ts: str | None = None, channel: str | None = None,
+        progress_cb: ProgressCb | None = None,
     ) -> str:
-        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply."""
+        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply.
+
+        There is no wall-clock cap: a run lives until it finishes, the user 🛑s
+        it, or the idle watchdog kills it after IDLE_TIMEOUT seconds with no
+        stream activity. While it runs, *progress_cb* (if given) is invoked with
+        an aggregated :class:`_Progress` snapshot at most once per
+        PROGRESS_INTERVAL, then once more with ``done=True`` for the summary.
+        """
         env = os.environ.copy()
         # Strip tokens that must never be reachable by the Claude subprocess.
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
@@ -644,20 +1267,27 @@ class ClaudeHandler:
             process.stdin.close()
 
             final_result: str | None = None
+            loop = asyncio.get_running_loop()
+            tracker = _ProgressTracker(loop.time())
+            last_event = loop.time()
+            flushed_once = False
+            idle_killed = False
 
             async def consume_stdout() -> None:
-                nonlocal final_result
+                nonlocal final_result, last_event
                 assert process.stdout is not None
                 async for raw_line in process.stdout:
                     line = raw_line.decode("utf-8", errors="replace").rstrip()
                     if not line:
                         continue
+                    last_event = loop.time()
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         logger.debug("claude stdout (non-json): %s", line[:1000])
                         continue
                     self._log_stream_event(event)
+                    tracker.ingest(event)
                     if (
                         isinstance(event, dict)
                         and event.get("type") == "result"
@@ -666,29 +1296,56 @@ class ClaudeHandler:
                         final_result = event["result"]
 
             async def consume_stderr() -> None:
+                nonlocal last_event
                 assert process.stderr is not None
                 async for raw_line in process.stderr:
                     line = raw_line.decode("utf-8", errors="replace").rstrip()
                     if line:
+                        last_event = loop.time()
                         logger.warning("claude stderr: %s", line[:1000])
+
+            async def monitor() -> None:
+                # Wakes every PROGRESS_INTERVAL to (1) kill genuinely-stuck runs
+                # (no activity for IDLE_TIMEOUT) and (2) push one aggregated
+                # progress update covering everything since the last push.
+                nonlocal flushed_once, idle_killed
+                interval = PROGRESS_INTERVAL if PROGRESS_INTERVAL > 0 else 10.0
+                while True:
+                    await asyncio.sleep(interval)
+                    now = loop.time()
+                    if IDLE_TIMEOUT > 0 and (now - last_event) >= IDLE_TIMEOUT:
+                        idle_killed = True
+                        logger.error(
+                            "Claude run idle for %.0fs (>=%ss) — killing as stuck.",
+                            now - last_event, IDLE_TIMEOUT,
+                        )
+                        _kill_process_tree(process)
+                        return
+                    idle = now - last_event
+                    # Flush every tick once we've been running ≥1 interval, so the
+                    # status appears at the first tick (~PROGRESS_INTERVAL) even if
+                    # the model is still on a long initial think — not only after
+                    # the first event. Runs that finish before the first tick stay
+                    # silent (no tick fired). Keeps elapsed/idle ticking too.
+                    if progress_cb is not None:
+                        try:
+                            await progress_cb(tracker.snapshot(now, idle=idle))
+                            flushed_once = True
+                        except Exception as exc:  # noqa: BLE001 — progress is best-effort
+                            logger.warning("progress update failed: %s", exc)
 
             stdout_task = asyncio.create_task(consume_stdout())
             stderr_task = asyncio.create_task(consume_stderr())
+            monitor_task = asyncio.create_task(monitor())
 
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(stdout_task, stderr_task, process.wait()),
-                    timeout=SUBPROCESS_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                _kill_process_tree(process)
-                await process.wait()
-                stdout_task.cancel()
-                stderr_task.cancel()
-                logger.error(
-                    "Claude subprocess timed out after %ds (last result=%r)",
-                    SUBPROCESS_TIMEOUT, (final_result or "")[:200],
-                )
+                await asyncio.gather(stdout_task, stderr_task, process.wait())
+            finally:
+                monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitor_task
+
+            if idle_killed:
                 _mark_finished()
                 return _TIMEOUT_REPLY
 
@@ -708,6 +1365,12 @@ class ClaudeHandler:
                 logger.warning("Claude stream ended with no result event.")
                 _mark_finished()
                 return "Sorry, I couldn't parse the response."
+            # Collapse the live status into a final summary — but only if we
+            # ever posted one. Short runs (finished before the first throttle
+            # tick) never created a status message, so stay silent here too.
+            if progress_cb is not None and flushed_once:
+                with contextlib.suppress(Exception):
+                    await progress_cb(tracker.snapshot(loop.time(), done=True))
             _mark_finished()
             return final_result
         finally:

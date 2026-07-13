@@ -173,7 +173,7 @@ class TestHandleMessagePersists:
         handler = ClaudeHandler(FakeSlackClient(), store_path=path)
         asyncio.run(handler.initialize())
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             return "reply"
         monkeypatch.setattr(handler, "_run_claude", fake_run)
 
@@ -331,7 +331,7 @@ class _SpyHandler(ClaudeHandler):
         self.runs: list[dict] = []
         self._scripted = list(replies)
 
-    async def _run_claude(self, cmd, prompt, cwd=None, thread_ts=None, channel=None):
+    async def _run_claude(self, cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         self.runs.append({"cmd": cmd, "prompt": prompt, "cwd": cwd, "thread_ts": thread_ts})
         return self._scripted.pop(0)
 

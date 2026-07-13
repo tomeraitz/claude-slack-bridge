@@ -19,7 +19,7 @@ class TestHandleMessageInjectsAttachments:
         h = _handler()
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "done"
 
@@ -42,7 +42,7 @@ class TestHandleMessageInjectsAttachments:
         h = _handler()
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -60,7 +60,7 @@ class TestHandleThreadReplyInjectsAttachments:
         monkeypatch.setattr(claude_handler, "_jsonl_path", lambda cwd, sid: Path(__file__))
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -85,7 +85,7 @@ class TestHandleThreadReplyInjectsAttachments:
         async def fake_build_prompt(channel, thread_ts):
             return "scraped history prompt"
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 

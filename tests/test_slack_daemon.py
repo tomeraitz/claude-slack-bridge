@@ -40,6 +40,11 @@ def make_daemon(monkeypatch) -> SlackDaemon:
                 return fn
             return _wrap
 
+        def action(self, _action_id):  # block_actions registration is a no-op
+            def _wrap(fn):
+                return fn
+            return _wrap
+
     monkeypatch.setattr(sd, "AsyncApp", _FakeApp)
     monkeypatch.setattr(sd, "AsyncSocketModeHandler", lambda *a, **k: object())
     return SlackDaemon(bot_token="xoxb-test", app_token="xapp-test")
@@ -55,7 +60,7 @@ class TestReactionLifecycle:
     def test_new_message_adds_then_removes_octagonal_sign(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text, files=None):
+        async def fake_handle_message(channel, message_ts, text, files=None, progress_cb=None):
             return "the reply"
 
         async def fake_post(channel, thread_ts, text):
@@ -77,7 +82,7 @@ class TestReactionLifecycle:
     def test_thread_reply_uses_reply_ts_as_trigger(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_reply(channel, thread_ts, text, files=None):
+        async def fake_reply(channel, thread_ts, text, files=None, progress_cb=None):
             return "reply"
 
         async def fake_post(channel, thread_ts, text):
@@ -98,7 +103,7 @@ class TestReactionLifecycle:
     def test_reaction_removed_even_on_error(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def boom(channel, message_ts, text, files=None):
+        async def boom(channel, message_ts, text, files=None, progress_cb=None):
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(d._claude, "handle_message", boom)
@@ -180,7 +185,7 @@ class TestStoppedSuppression:
     def test_stopped_thread_skips_normal_reply(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text, files=None):
+        async def fake_handle_message(channel, message_ts, text, files=None, progress_cb=None):
             # Simulate the user having stopped this run mid-flight.
             d._claude._stopped.add(message_ts)
             return "partial reply that must NOT be posted"
@@ -201,7 +206,7 @@ class TestStoppedSuppression:
     def test_normal_run_still_posts(self, monkeypatch):
         d = make_daemon(monkeypatch)
 
-        async def fake_handle_message(channel, message_ts, text, files=None):
+        async def fake_handle_message(channel, message_ts, text, files=None, progress_cb=None):
             return "normal reply"
 
         posted = []
@@ -222,7 +227,7 @@ class TestStoppedSuppression:
         # the same thread_ts is not silently suppressed.
         d = make_daemon(monkeypatch)
 
-        async def boom(channel, message_ts, text, files=None):
+        async def boom(channel, message_ts, text, files=None, progress_cb=None):
             d._claude._stopped.add(message_ts)
             raise RuntimeError("kaboom")
 
@@ -237,7 +242,7 @@ class TestStoppedSuppression:
         # (keyed on thread_ts, with a distinct trigger_ts).
         d = make_daemon(monkeypatch)
 
-        async def fake_reply(channel, thread_ts, text, files=None):
+        async def fake_reply(channel, thread_ts, text, files=None, progress_cb=None):
             d._claude._stopped.add(thread_ts)
             return "partial reply that must NOT be posted"
 
@@ -253,3 +258,72 @@ class TestStoppedSuppression:
 
         assert posted == []  # reply suppressed
         assert "100.1" not in d._claude._stopped  # flag cleared for next run
+
+
+class TestLiveProgressToggle:
+    def test_reporter_built_when_on(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", True)
+        assert d._make_reporter("C1", "T1", "T1") is not None
+
+    def test_no_reporter_when_off(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", False)
+        assert d._make_reporter("C1", "T1", "T1") is None
+
+
+class TestStatusReactionStop:
+    def test_status_post_wires_reaction_and_drops_trigger(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        monkeypatch.setattr(sd, "LIVE_PROGRESS", True)
+        reporter = d._make_reporter("C1", "thread.1", "trig.1")
+
+        # Simulate the reporter's first post invoking its on_status_posted hook.
+        asyncio.run(reporter._on_status_posted("status.9"))
+
+        # Reacting 🛑 on the status message now resolves to the run...
+        assert d._trigger_to_thread["status.9"] == "thread.1"
+        # ...the bot put 🛑 on the status message...
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "status.9"} \
+            in d._app.client.added
+        # ...and removed the now-redundant trigger-message reaction.
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "trig.1"} \
+            in d._app.client.removed
+
+    def test_reaction_on_status_message_stops_run(self, monkeypatch):
+        d = make_daemon(monkeypatch)
+        d._bot_user_id = "U_bot"
+        d._trigger_to_thread["status.9"] = "thread.1"  # as wired when status posted
+        stopped = []
+
+        async def fake_stop(t):
+            stopped.append(t)
+            return True
+
+        monkeypatch.setattr(d._claude, "stop", fake_stop)
+        ev = {"reaction": "octagonal_sign", "user": "U_human",
+              "item": {"channel": "C1", "ts": "status.9"}}
+
+        asyncio.run(d._handle_reaction_added(ev))
+
+        assert stopped == ["thread.1"]
+        assert d._app.client.posted == [
+            {"channel": "C1", "thread_ts": "thread.1", "text": "⏹️ Stopped."}
+        ]
+
+    def test_unwind_clears_mapping_and_reaction_when_message_present(self, monkeypatch):
+        import slack_daemon as sd
+        d = make_daemon(monkeypatch)
+        reporter = sd._ProgressReporter(d._app.client, "C1", "thread.1")
+        reporter.posted_ts = "status.9"
+        reporter._status_ts = "status.9"  # still present (finished as summary)
+        d._trigger_to_thread["status.9"] = "thread.1"
+
+        asyncio.run(d._unwind_status_stop("C1", reporter))
+
+        assert "status.9" not in d._trigger_to_thread
+        assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "status.9"} \
+            in d._app.client.removed

@@ -1183,6 +1183,7 @@ class ClaudeHandler:
             "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
             "--output-format", "stream-json",
             "--verbose",
+            "--disallowed-tools", "mcp__claude_ai_Slack__*",
         ]
         if plugin_dir:
             cmd.extend(["--plugin-dir", plugin_dir])

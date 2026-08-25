@@ -1,0 +1,52 @@
+name: Publish release
+
+# Builds the release archive and turns it into the GitHub release.
+#
+# The release is created as a draft, filled, and only then published. A draft
+# carries no tag — GitHub creates it at the moment of publishing — so a run that
+# dies partway leaves a discardable draft and no tag pointing at a release that
+# does not exist. That is also why resolve-release.yml counts drafts when it
+# picks the next number.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # `git archive` needs the repository, which is why this job checks out at
+      # all: the release artifact IS the source tree, built from the commit this
+      # run was triggered by.
+      - name: Build the archive
+        run: ./packaging/archive.sh "$VERSION" dist
+
+      - name: Create the draft release
+        run: |
+          # --target pins the tag to the commit this run was triggered by, so
+          # the release names the tree it was built from even if main has moved
+          # on by the time it is published.
+          gh release create "v${VERSION}" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "v${VERSION}" \
+              --generate-notes \
+              dist/*
+
+      - name: Publish it
+        run: |
+          # Creates the tag. Everything downstream — the formula's download URL
+          # above all — needs the assets reachable, which they are not while the
+          # release is a draft.
+          gh release edit "v${VERSION}" --draft=false

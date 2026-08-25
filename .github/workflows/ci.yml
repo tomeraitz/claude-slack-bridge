@@ -1,0 +1,67 @@
+name: CI
+
+# The whole pipeline, as one run per push. Checks on every branch; on main the
+# same run goes on to publish a release and the formula that installs it.
+#
+# Nothing here is triggered by a tag or dispatched from another workflow. The
+# release tag is created by publishing the release, at the end of this run — so
+# there is no second workflow to start, no credential beyond the built-in token,
+# and no version commit on any branch. Whether a push releases is decided in
+# exactly one place, resolve-release.yml, and every job below keys off its
+# output rather than testing the branch itself.
+on:
+  push:
+    # Branches only. Publishing a release creates its tag, and a tag that
+    # re-entered this pipeline would try to release again.
+    branches: ['**']
+
+# One run at a time per branch. Two main runs must not resolve the same version,
+# so they queue instead — and a release must never be cancelled halfway, which is
+# why only the other branches supersede themselves.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Raised per job, only where it is needed: the checks never get write access,
+# and a called workflow cannot raise what it is given.
+permissions:
+  contents: read
+
+# On the actions/checkout@v7.0.1 pin used throughout: it is the newest
+# published release, not a typo. Static reviewers trained before v7 shipped
+# report it as unresolvable — verified against the API and in use by
+# lexbrugman/lastpass-ssh-agent's green pipeline. Do not downgrade it on that
+# advice alone; check `gh api repos/actions/checkout/tags` first.
+jobs:
+  release-version:
+    uses: ./.github/workflows/resolve-release.yml
+
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+
+  publish-release:
+    needs: [release-version, checks]
+    if: needs.release-version.outputs.version != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      version: ${{ needs.release-version.outputs.version }}
+
+  # Last, and only once the release is published: the formula points at the
+  # release's download URL, which nothing can fetch until then.
+  publish-homebrew-formula:
+    # `checks` is not listed because publish-release already waits on it.
+    # `release-version` is implied by that same chain, but outputs are only
+    # readable from a direct dependency — drop it and `version` resolves to
+    # empty, which skips this job silently rather than failing it.
+    needs: [release-version, publish-release]
+    if: needs.release-version.outputs.version != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-homebrew-formula.yml
+    with:
+      version: ${{ needs.release-version.outputs.version }}
+    secrets: inherit

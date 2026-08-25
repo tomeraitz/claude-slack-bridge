@@ -1,0 +1,152 @@
+#!/bin/sh
+# Run the claude-slack-bridge daemon in the foreground, from wherever it is
+# installed.
+#
+#   claude-slack-bridge            start it (this is what `brew services` runs)
+#   claude-slack-bridge reload     re-read projects.json, live
+#   claude-slack-bridge logs       follow the container log
+#   claude-slack-bridge config     print the config file in effect
+#
+# Foreground on purpose: launchd and systemd supervise a process, and there is
+# nothing to supervise if compose detaches. The container's own restart policy
+# is switched off here for the same reason — two supervisors racing to restart
+# one container is how you get a daemon that flaps and a `brew services stop`
+# that does not stop anything.
+set -eu
+
+# launchd and systemd hand a service a minimal PATH, and Docker's CLI is not on
+# it: Docker Desktop puts it in /usr/local/bin or ~/.docker/bin, OrbStack in
+# ~/.orbstack/bin. Appended, not prepended, so an interactive run still uses
+# whichever docker the user's own PATH already found.
+PATH="$PATH:/usr/local/bin:$HOME/.docker/bin:$HOME/.orbstack/bin"
+export PATH
+
+# Both placeholders are rewritten by the Homebrew formula at install time.
+# Unsubstituted — running straight out of a git checkout — @LIBEXEC@ holds no
+# compose file, and the repo this script sits in is the right answer instead.
+# The prefix is not derived from this script's path: libexec sits four levels
+# below it inside the Cellar, and counting ".." to get back out breaks the day
+# Homebrew changes that layout.
+libexec="@LIBEXEC@"
+etc="@ETC@"
+
+if [ ! -f "$libexec/docker-compose.yml" ]; then
+    libexec="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+
+compose_file="$libexec/docker-compose.yml"
+if [ ! -f "$compose_file" ]; then
+    echo "claude-slack-bridge: no docker-compose.yml at $compose_file" >&2
+    exit 1
+fi
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-bridge"
+xdg_config="$config_home/config.env"
+
+# In order: the user's own config, the machine-level one a formula install
+# provides a template for, and — for a git checkout — the .env the plain
+# `docker compose up` instructions in the README tell you to create.
+if [ -f "$xdg_config" ]; then
+    config="$xdg_config"
+elif [ -f "$etc/config.env" ]; then
+    config="$etc/config.env"
+elif [ -f "$libexec/.env" ]; then
+    config="$libexec/.env"
+else
+    cat >&2 <<EOF
+claude-slack-bridge: no config file.
+
+Looked in:
+  $xdg_config
+  $etc/config.env
+  $libexec/.env
+
+Copy the template and fill in your Slack tokens:
+
+  mkdir -p $config_home
+  cp $libexec/config.env.default $xdg_config
+  chmod 600 $xdg_config
+
+It holds two secrets, which is why it is not created for you and why an
+upgrade never touches it.
+EOF
+    exit 1
+fi
+
+# Resolve to an absolute path: compose resolves a relative env_file against the
+# compose file's own directory rather than the caller's.
+config="$(cd "$(dirname "$config")" && pwd)/$(basename "$config")"
+config_dir="$(dirname "$config")"
+
+# The channel → project mapping lives beside the config, not in the installed
+# tree, so an upgrade cannot replace it. It is bind-mounted into the container,
+# and Docker silently creates a DIRECTORY where a bind source is missing —
+# which the daemon then fails to parse — so make sure it is a file first.
+projects_json="$config_dir/projects.json"
+if [ ! -e "$projects_json" ]; then
+    echo '{}' > "$projects_json"
+    echo "claude-slack-bridge: created an empty $projects_json" >&2
+fi
+if [ ! -f "$projects_json" ]; then
+    echo "claude-slack-bridge: $projects_json is not a regular file" >&2
+    exit 1
+fi
+
+# --env-file feeds interpolation in the compose file; BRIDGE_ENV_FILE is what
+# gets the same values into the container. Both are needed, and both name the
+# one file the user edits. Exported rather than passed through a wrapper
+# function because the commands below have to be exec'd, and `exec` cannot run
+# a shell function.
+export BRIDGE_ENV_FILE="$config"
+export PROJECTS_JSON="$projects_json"
+export RESTART_POLICY=no
+
+case "${1:-start}" in
+    start)
+        # Docker is not up yet at login, and a service that exited here would be
+        # restarted by launchd in a tight loop, so wait it out instead. The
+        # notice repeats rarely: a Docker that never arrives should be visible in
+        # the log without burying everything else in it.
+        waited=0
+        until docker info > /dev/null 2>&1; do
+            if [ "$((waited % 60))" -eq 0 ]; then
+                echo "claude-slack-bridge: waiting for Docker (${waited}s)" >&2
+            fi
+            sleep 5
+            waited="$((waited + 5))"
+        done
+
+        # --build because the image has to match the installed source: an
+        # upgrade replaces the tree under libexec and the old image would keep
+        # serving otherwise. It is a cache hit and near-instant when nothing
+        # changed.
+        exec docker compose \
+            --project-name claude-slack-bridge \
+            --file "$compose_file" \
+            --env-file "$config" \
+            up --build
+        ;;
+    reload)
+        shift
+        # WORKDIR is /app/src, which is where reloadctl.py lives. Straight into
+        # the container because the daemon's control socket is a Unix socket in
+        # the container's own filesystem.
+        exec docker exec claude-slack-bridge python reloadctl.py "$@"
+        ;;
+    logs)
+        shift
+        exec docker compose \
+            --project-name claude-slack-bridge \
+            --file "$compose_file" \
+            --env-file "$config" \
+            logs --follow "$@"
+        ;;
+    config)
+        echo "$config"
+        ;;
+    *)
+        echo "claude-slack-bridge: unknown command: $1" >&2
+        echo "usage: claude-slack-bridge [start|reload|logs|config]" >&2
+        exit 1
+        ;;
+esac

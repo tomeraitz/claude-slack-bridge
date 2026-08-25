@@ -1,0 +1,85 @@
+name: publish-homebrew-formula
+
+# The last step of a release: ci.yml runs this once the release is published,
+# which is when the download URL the formula points at starts resolving.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # The tap key lives in this environment rather than in a repository secret:
+    # whoever can write the tap can ship a formula to everyone who installs, so
+    # restrict the environment to main and no workflow on any other branch can
+    # read it.
+    environment: release
+    env:
+      # A deploy key with write access to <owner>/homebrew-tap, as the secret
+      # TAP_DEPLOY_KEY. A deploy key rather than a token because it is bound to
+      # that one repository, belongs to no user account, and never expires.
+      # Without the secret the formula is only attached to the release.
+      TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Generate the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Take the checksum from the release rather than from a workflow
+          # artifact: that is the file users actually download, and by the time
+          # this runs the release is published, so it exists.
+          mkdir -p artifacts
+          gh release download "v${VERSION}" --pattern '*.sha256' --dir artifacts
+          ./packaging/homebrew/generate-formula.sh \
+            "$VERSION" "${{ github.repository }}" artifacts \
+            > claude-slack-bridge.rb
+          cat claude-slack-bridge.rb
+
+      - name: Attach the formula to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release upload "v${VERSION}" claude-slack-bridge.rb --clobber
+
+      - name: Update the Homebrew tap
+        if: env.TAP_DEPLOY_KEY != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          key="$(mktemp)"
+          # the trailing newline matters: ssh rejects a key without one
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          known="$(mktemp)"
+          # Trust-on-first-use, deliberately. Pinning GitHub's host keys here
+          # would close a real gap, but a narrow one: it needs an active MITM
+          # between a GitHub-hosted runner and github.com, SSH auth is
+          # challenge-response so the deploy key is never disclosed, and the
+          # worst outcome is a push that reports success while the tap is
+          # unchanged — visible at the next `brew upgrade`. The cost is a
+          # hardcoded key list that breaks this workflow every time GitHub
+          # rotates. Reviewed and accepted; not an oversight.
+          ssh-keyscan github.com > "$known" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known"
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          # the numeric id is what links the commit to the bot account; without
+          # it GitHub shows an unattributed author
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone "git@github.com:${owner}/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp claude-slack-bridge.rb tap/Formula/
+          cd tap
+          git add Formula/claude-slack-bridge.rb
+          git commit -m "claude-slack-bridge $VERSION"
+          git push
+          rm -f "$key"

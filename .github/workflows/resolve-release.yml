@@ -1,0 +1,65 @@
+name: Resolve release
+
+# The one place a release version is decided. Every downstream job keys off the
+# output: a non-empty version means "this push releases", and nothing else in
+# the pipeline looks at the branch. Pushes to any other branch resolve to an
+# empty string and only run the checks.
+on:
+  workflow_call:
+    outputs:
+      version:
+        description: The version to release, or empty on a branch that does not release.
+        value: ${{ jobs.resolve.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # No checkout: the version comes from the releases that already exist,
+      # which is an API call, and nothing here reads the tree.
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "$GITHUB_REF does not release"
+              exit 0
+          fi
+
+          # Every release that exists, drafts included, AND every tag. Both
+          # halves matter and neither covers the other:
+          #
+          #   * a draft holds no tag — it is what a release that failed after
+          #     its assets went up leaves behind — and reusing its number would
+          #     collide the moment it was ever published;
+          #   * a tag can outlive its release, because deleting a release does
+          #     not delete the tag. Reusing that number would either fail on
+          #     the existing tag or, worse, hang the new release off the tag's
+          #     older commit, so the artifact and the tag would disagree about
+          #     what was released.
+          # Fetched into separate variables, not one substitution running both:
+          # a substitution reports only the LAST command's status, so a failed
+          # releases call there would go unnoticed under `set -e` and resolve a
+          # version that is already taken. One assignment each fails loudly.
+          releases="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq '.[].tag_name')"
+          tags="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/tags" \
+              --jq '.[].name')"
+          taken="$(printf '%s\n%s\n' "$releases" "$tags")"
+
+          year="$(date -u +%Y)"
+          # MMDD as a number: semver forbids the leading zero in "0810"
+          month_day="$((10#$(date -u +%m%d)))"
+          patch=0
+          while printf '%s\n' "$taken" | grep -qx "v${year}.${month_day}.${patch}"; do
+              patch="$((patch + 1))"
+          done
+
+          version="${year}.${month_day}.${patch}"
+          echo "releasing $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"

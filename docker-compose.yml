@@ -2,8 +2,9 @@ services:
   claude-slack-bridge:
     container_name: claude-slack-bridge
     build: .
+    # BRIDGE_ENV_FILE lets the config live outside this tree — docs/homebrew.md
     env_file:
-      - .env
+      - ${BRIDGE_ENV_FILE:-.env}
     environment:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
@@ -17,4 +18,7 @@ services:
       - ${HOME}/.claude.json:/home/appuser/.claude.json:rw
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
-    restart: unless-stopped
+      # The channel → project mapping: runtime config, so an edit needs no rebuild
+      - ${PROJECTS_JSON:-./projects.json}:/app/projects.json:ro
+    # "no" under `brew services`, so launchd is the only supervisor
+    restart: ${RESTART_POLICY:-unless-stopped}

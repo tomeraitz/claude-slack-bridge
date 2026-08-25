@@ -41,11 +41,13 @@ Map each Slack channel to its project folder name (relative to `/projects/` insi
 
 See `projects.json.example` for a template.
 
-### 3. Rebuild
+### 3. Start the daemon
 
 ```bash
 docker compose up -d --build
 ```
+
+`projects.json` is bind-mounted, so editing it later needs no rebuild.
 
 ### Adding new projects
 

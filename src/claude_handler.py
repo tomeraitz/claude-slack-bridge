@@ -157,8 +157,10 @@ def _load_project_map() -> dict[str, Any]:
     Values may be a plain path string (legacy) or a dict with ``path`` and
     optional ``plugin_dir`` keys (extended format).
     """
-    if not PROJECTS_CONFIG.exists():
-        logger.warning("No projects.json at %s — project detection disabled.", PROJECTS_CONFIG)
+    # is_file(), not exists(): a bind mount with no host file leaves a DIRECTORY
+    # here, and open() on that would raise IsADirectoryError out of this function.
+    if not PROJECTS_CONFIG.is_file():
+        logger.warning("No projects.json file at %s — project detection disabled.", PROJECTS_CONFIG)
         return {}
     with open(PROJECTS_CONFIG) as f:
         mapping = json.load(f)

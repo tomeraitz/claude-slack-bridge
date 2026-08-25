@@ -37,12 +37,15 @@ Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get you
 git clone https://github.com/your-username/claude-slack-bridge.git
 cd claude-slack-bridge
 cp .env.example .env   # fill in SLACK_BOT_TOKEN and SLACK_APP_TOKEN
+cp projects.json.example projects.json   # bind-mounted, so create it even if unused
 docker compose up -d --build
 ```
 
 The container starts automatically on system boot (`restart: unless-stopped`) and uses Socket Mode — no public URL or inbound firewall rules needed.
 
 **You only do this once.** The daemon stays running in the background and serves all your Claude Code projects.
+
+> Prefer `brew services` to supervise it, with your config kept outside the source tree? See [docs/homebrew.md](docs/homebrew.md).
 
 ### 3. Add `.mcp.json` to your Claude Code project
 
@@ -112,11 +115,13 @@ kill -HUP <daemon-pid>     # no CLI needed; same effect, no confirmation line
 
 The reload affects only *new* threads; conversations already running stay in the directory they started in. See **[docs/reloading-projects.md](docs/reloading-projects.md)**.
 
-### 3. Rebuild
+### 3. Start the daemon
 
 ```bash
 docker compose up -d --build
 ```
+
+`projects.json` is bind-mounted, so editing it later needs no rebuild.
 
 Then in Slack:
 

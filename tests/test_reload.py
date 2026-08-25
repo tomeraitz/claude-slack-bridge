@@ -273,3 +273,23 @@ class TestReloadVerbAndSignal:
             return calls
 
         assert asyncio.run(run()) == [1]
+
+
+class TestMissingProjectsFile:
+    """projects.json is bind-mounted, and Docker mounts a directory when the
+    host file is absent. Both shapes of "no mapping" must disable project
+    detection rather than raise out of the loader and kill the daemon."""
+
+    def test_absent_file_disables_project_detection(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(claude_handler, "PROJECTS_CONFIG", tmp_path / "nope.json")
+        assert claude_handler._load_project_map() == {}
+
+    def test_directory_at_the_mount_point_disables_project_detection(
+        self, tmp_path, monkeypatch
+    ):
+        # Exactly what `docker compose up` leaves behind when the bind source
+        # does not exist on the host. exists() is true for it; open() is not.
+        mount_point = tmp_path / "projects.json"
+        mount_point.mkdir()
+        monkeypatch.setattr(claude_handler, "PROJECTS_CONFIG", mount_point)
+        assert claude_handler._load_project_map() == {}

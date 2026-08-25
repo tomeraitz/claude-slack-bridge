@@ -19,9 +19,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source and project config
+# Copy application source. projects.json is not copied: it is bind-mounted at
+# runtime by docker-compose.yml, so it must not be a build input.
 COPY src/ ./src/
-COPY projects.json .
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

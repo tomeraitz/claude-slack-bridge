@@ -1,0 +1,58 @@
+name: Checks
+
+# Runs on every branch. Nothing here writes anything, and a release waits on it.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v6.0.0
+        with:
+          # The same version the container runs, so a syntax or stdlib
+          # difference cannot pass here and fail in the image.
+          python-version: '3.12'
+
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # The formula is assembled by string substitution, so a broken edit yields
+      # a file that reads fine and only fails at `brew install`.
+      - run: ./packaging/homebrew/test-generate-formula.sh
+
+      # These two run under /bin/sh in launchd and in CI respectively, where a
+      # syntax error surfaces as a restart loop rather than an error message.
+      - name: Shell syntax
+        run: |
+          for script in bin/claude-slack-bridge packaging/archive.sh \
+                        packaging/homebrew/generate-formula.sh entrypoint.sh; do
+              sh -n "$script"
+          done
+          bash -n reload-mapping.sh
+
+      # A tarball that builds nothing installs cleanly and fails at first start.
+      # archive.sh checks its own output for the build inputs; this makes sure
+      # that check runs on every push, not only on a release.
+      - name: Build the release archive
+        run: ./packaging/archive.sh 0.0.0-check dist
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # projects.json is git-ignored and no longer COPYied, so this is the check
+      # that the image still builds from a clean tree — the exact thing a
+      # release tarball is.
+      - run: docker build .

@@ -1,0 +1,18 @@
+# Kept out of the release tarball packaging/archive.sh builds. What ships is
+# what the installed daemon needs to run and the docs that explain it; the test
+# suite, the release machinery itself, and working notes are not that.
+#
+# A directory named here has export-ignore set on the directory ENTRY, and
+# `git archive` prunes the whole subtree. Note that `git check-attr` on a file
+# INSIDE one still says "unspecified" — gitattributes patterns match the path
+# they name, and unlike .gitignore a directory pattern does not extend over its
+# contents. That is expected rather than broken, and it is subtle enough that
+# archive.sh verifies the resulting tarball instead of trusting this file.
+tests             export-ignore
+pytest.ini        export-ignore
+packaging         export-ignore
+.github           export-ignore
+plans             export-ignore
+.roadmap_features export-ignore
+.gitattributes    export-ignore
+.gitignore        export-ignore

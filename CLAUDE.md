@@ -2,7 +2,7 @@
 
 ## Communication
 
-Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a conversation, ALL further communication with the user must go through that tool. Do not use `AskUserQuestion`, and do not ask questions or request feedback as text in the terminal. Continue communicating exclusively via Slack until the user explicitly tells you to switch back to the terminal.
+Work in the terminal normally. Only reach out via Slack (using `mcp__claude-slack-bridge__ask_on_slack`) when you hit a roadblock — e.g. you need clarification, approval for a risky action, or are blocked on a decision. Day-to-day output and progress stays in the terminal. Do not use `AskUserQuestion` once you have sent your first Slack message in a conversation.
 
 **Exception — setup/configuration skills:** The following skills run locally inside Claude Code as part of `/process-setup` and must use `AskUserQuestion` (not Slack), even if `ask_on_slack` was already used earlier in the session:
 
@@ -11,7 +11,7 @@ Once you use `mcp__claude-slack-bridge__ask_on_slack` for the first time in a co
 - `build-run-plan-flow`
 - `build-process-skill`
 
-While executing any of these skills, follow the skill's own instructions for clarifications (local `AskUserQuestion`). Resume the Slack-only rule once the skill returns.
+While executing any of these skills, follow the skill's own instructions for clarifications (local `AskUserQuestion`). Resume the normal communication rule above once the skill returns.
 
 ## Adding a channel → folder route
 

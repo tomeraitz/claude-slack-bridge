@@ -60,7 +60,8 @@ class MCPServer:
             mcp: The FastMCP server instance owned by ``main.py``.
         """
         mcp.tool()(self.ask_on_slack)
-        logger.info("Registered 'ask_on_slack' tool on MCP server.")
+        mcp.tool()(self.notify_on_slack)
+        logger.info("Registered MCP tools on server.")
 
     async def ask_on_slack(self, message: str, ctx: Context) -> str:
         """
@@ -83,3 +84,20 @@ class MCPServer:
         label = await _derive_worktree_label(ctx)
         reply = await self._broker.send_and_wait(message, label)
         return reply
+
+    async def notify_on_slack(self, message: str, ctx: Context) -> str:
+        """
+        Send a one-way notification to Slack. Does not wait for a reply.
+
+        Use this to keep the user informed of progress, status changes,
+        or to flag that you are waiting on something.
+
+        Args:
+            message: The notification text to post.
+
+        Returns:
+            Confirmation that the notification was sent.
+        """
+        logger.info("notify_on_slack called with message: %r", message)
+        label = await _derive_worktree_label(ctx)
+        return await self._broker.send_only(message, label)

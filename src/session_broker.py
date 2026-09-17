@@ -60,3 +60,20 @@ class SessionBroker:
             return reply
         finally:
             writer.close()
+
+    async def send_only(self, message: str, label: str | None = None) -> str:
+        """
+        Post *message* to Slack without waiting for a reply.
+
+        Args:
+            message: The text to post to the Slack channel.
+            label:   Optional worktree tag, applied like in ``send_and_wait``.
+
+        Returns:
+            Confirmation that the notification was posted.
+        """
+        thread_ts = await self._post_message(message, self._thread_ts, label)
+        if self._thread_ts is None:
+            self._thread_ts = thread_ts
+        logger.info("Posted notification on thread %s.", thread_ts)
+        return "Notification sent."

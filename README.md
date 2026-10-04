@@ -25,6 +25,8 @@ Slack @bot   ──────────────────▶  claude -
 
 ## Quickstart — Claude → Slack
 
+> **No Docker?** If you only need Claude → Slack (`ask_on_slack`, `notify_on_slack`, or `send`/`ask` from the shell), use the native CLI instead. You don't need a container or a daemon: run `./install.sh`, then `claude mcp add claude-slack-bridge -e SLACK_CHANNEL="#my-channel" -- claude-slack-bridge mcp`. See **[docs/cli.md](docs/cli.md)**.
+
 ### 1. Create a Slack app and get tokens
 
 Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get your `xoxb-` and `xapp-` tokens, and invite the bot to a channel.
@@ -165,12 +167,13 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 | Understand the daemon + session internals | [docs/architecture.md](docs/architecture.md) |
 | Use the `/process` GitHub PR workflow | [docs/github-setup.md](docs/github-setup.md) |
 | Wire `.mcp.json` in a Claude Code project | [docs/mcp-client-setup.md](docs/mcp-client-setup.md) |
+| Use the bridge without Docker (native CLI) | [docs/cli.md](docs/cli.md) |
 
 ---
 
 ## Requirements
 
-- Docker (with Docker Compose)
+- Docker (with Docker Compose), or Python 3.10+ for the [native CLI](docs/cli.md) (Claude → Slack only)
 - A Slack workspace where you can create apps
 - Claude Code (or any MCP-compatible client)
 

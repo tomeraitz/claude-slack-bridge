@@ -1,0 +1,23 @@
+#!/bin/sh
+# claude-slack-bridge — native CLI wrapper (no Docker). Runs src/cli.py with the
+# bridge's own virtualenv, so it works from any directory and through a symlink
+# (install.sh links it into ~/.local/bin).
+set -e
+
+# Resolve symlinks to find the repo (portable: no `readlink -f` on older macOS).
+self="$0"
+while [ -L "$self" ]; do
+    target="$(readlink "$self")"
+    case "$target" in
+        /*) self="$target" ;;
+        *) self="$(dirname "$self")/$target" ;;
+    esac
+done
+repo="$(cd "$(dirname "$self")/.." && pwd)"
+
+python="$repo/.venv/bin/python"
+if [ ! -x "$python" ]; then
+    echo "claude-slack-bridge: no virtualenv at $repo/.venv — run $repo/install.sh first." >&2
+    exit 1
+fi
+exec "$python" "$repo/src/cli.py" "$@"

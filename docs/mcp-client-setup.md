@@ -4,6 +4,10 @@ This guide explains how to configure a Claude Code project to use the bridge via
 
 ---
 
+> **Without Docker:** the native CLI registers the same tools without needing the daemon:
+> `claude mcp add claude-slack-bridge -e SLACK_CHANNEL="#your-channel" -- claude-slack-bridge mcp`.
+> See [cli.md](cli.md).
+
 ## Prerequisites
 
 The daemon container must be running before any Claude session can use the bridge.
